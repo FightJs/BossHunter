@@ -7,11 +7,13 @@ from bosshunter.ai.scorer import get_scoring_concurrency
 
 
 class ScoringConfigTests(unittest.TestCase):
-    def test_default_scoring_concurrency_is_one(self):
-        config = load_config()
+    def test_default_scoring_concurrency_is_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = load_config(Path(tmp) / "missing-config.yaml")
 
-        self.assertEqual(config["ai"]["scoring_concurrency"], 1)
-        self.assertEqual(get_scoring_concurrency(config), 1)
+        self.assertEqual(config["ai"]["scoring_concurrency"], 2)
+        self.assertEqual(get_scoring_concurrency(config), 2)
+        self.assertEqual(get_scoring_concurrency({}), 2)
 
     def test_scoring_concurrency_is_clamped_to_one_through_three(self):
         self.assertEqual(get_scoring_concurrency({"ai": {"scoring_concurrency": 0}}), 1)

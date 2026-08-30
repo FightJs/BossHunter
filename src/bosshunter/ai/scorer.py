@@ -26,8 +26,8 @@ from bosshunter.scoring_selection import select_scoring_jobs, validate_options
 console = Console()
 
 def get_scoring_concurrency(config: dict) -> int:
-    """Return a conservative, user-configurable AI scoring worker count."""
-    raw_value = config.get("ai", {}).get("scoring_concurrency", 1)
+    """Return a bounded, user-configurable AI scoring worker count."""
+    raw_value = config.get("ai", {}).get("scoring_concurrency", 2)
     try:
         value = int(raw_value)
     except (TypeError, ValueError):

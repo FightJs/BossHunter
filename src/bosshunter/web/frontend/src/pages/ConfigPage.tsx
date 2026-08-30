@@ -526,12 +526,12 @@ export default function ConfigPage() {
             </Field>
             <Field label="AI 评分并发数">
               <Select
-                value={String(config.ai?.scoring_concurrency || 1)}
+                value={String(config.ai?.scoring_concurrency || 2)}
                 onChange={e => updateConfig('ai.scoring_concurrency', Number(e.target.value))}
               >
                 {[1, 2, 3].map(value => <option key={value} value={value}>{value}</option>)}
               </Select>
-              <p className="mt-1 text-xs text-muted">默认 1；提高并发会增加 API 限流风险。</p>
+              <p className="mt-1 text-xs text-muted">默认 2；可降至 1 以降低 API 限流风险，或提升至 3 以加快评分。</p>
             </Field>
             <div className="flex items-center justify-between rounded-lg border border-card-border bg-[#FFFCFA] p-3">
               <div>

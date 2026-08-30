@@ -102,7 +102,7 @@ ai:
   timeout_seconds: 180
   scoring_max_tokens: 8192
   scoring_max_attempts: 2
-  scoring_concurrency: 1          # AI评分并发数，范围1-3；数据库仍串行写入
+  scoring_concurrency: 2          # AI评分并发数，默认2、范围1-3；数据库仍串行写入
   scoring_second_review: false    # 可选：对68-79分临界岗位进行一次独立复核
   greeting_max_tokens: 8192
   greeting_review_max_tokens: 4096

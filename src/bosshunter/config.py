@@ -158,7 +158,7 @@ DEFAULTS: dict[str, Any] = {
         "timeout_seconds": 180,
         "scoring_max_tokens": 8192,
         "scoring_max_attempts": 2,
-        "scoring_concurrency": 1,
+        "scoring_concurrency": 2,
         "scoring_second_review": False,
         "greeting_max_tokens": 8192,
         "greeting_review_max_tokens": 4096,
