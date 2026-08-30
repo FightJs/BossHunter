@@ -7,6 +7,7 @@ import { Switch } from '@/components/ui/switch'
 import type { WorkbenchTask } from '@/hooks/useDashboard'
 
 type PlatformId = 'boss' | 'zhilian' | '51job'
+type ExecutionMode = 'safe_serial' | 'pipelined' | 'parallel_pilot'
 
 interface PlatformDraft {
   enabled: boolean
@@ -92,6 +93,8 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
   const [drafts, setDrafts] = useState(initialDrafts)
   const [order, setOrder] = useState<PlatformId[]>(['boss'])
   const [autoScore, setAutoScore] = useState(false)
+  const [executionMode, setExecutionMode] = useState<ExecutionMode>('safe_serial')
+  const [parallelPilotEnabled, setParallelPilotEnabled] = useState(false)
   const [error, setError] = useState('')
   const [zhilianCities, setZhilianCities] = useState<PlatformCityOption[]>([])
   const [job51Cities, setJob51Cities] = useState<PlatformCityOption[]>([])
@@ -118,6 +121,9 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
         setDrafts({ boss: nextBoss, zhilian: nextZhilian, '51job': nextJob51 })
         setOrder(mode === 'full' ? ['boss'] : (nextOrder.length ? nextOrder : ['boss']))
         setAutoScore(mode === 'full' || config?.collection?.auto_score_default === true)
+        const configuredMode = config?.collection?.execution_mode
+        setExecutionMode(configuredMode === 'pipelined' || configuredMode === 'parallel_pilot' ? configuredMode : 'safe_serial')
+        setParallelPilotEnabled(config?.collection?.parallel_pilot_enabled === true)
       })
       .catch(() => {
         if (!cancelled) setError('读取采集默认配置失败，可直接填写后启动。')
@@ -208,7 +214,12 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
         sort: draft.sort,
       }
     }
-    onStart({ platform_order: enabledOrder, auto_score: mode === 'full' ? true : autoScore, platforms })
+    onStart({
+      platform_order: enabledOrder,
+      auto_score: mode === 'full' ? true : autoScore,
+      execution_mode: mode === 'full' ? 'safe_serial' : executionMode,
+      platforms,
+    })
   }
 
   return (
@@ -218,7 +229,7 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
           <div>
             <div className="text-xs font-black tracking-[0.18em] text-primary">COLLECT JOBS</div>
             <h2 className="mt-1 text-2xl font-black">{mode === 'full' ? '全流程采集设置' : '岗位采集'}</h2>
-            <p className="mt-1 text-sm leading-6 text-muted">平台会按队列严格串行执行；每个平台只设置最大页数和排序。</p>
+            <p className="mt-1 text-sm leading-6 text-muted">选择平台、页数和执行速度；BOSS 采集始终保持单通道与既有安全间隔。</p>
           </div>
           <Button variant="ghost" size="sm" onClick={onClose} aria-label="关闭"><X className="h-5 w-5" /></Button>
         </div>
@@ -226,6 +237,12 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
         {activeTask?.progress?.platforms && (
           <div className="mt-4 rounded-2xl border border-primary/20 bg-[#FFF0E5] p-4">
             <div className="text-sm font-black text-primary">采集进行中</div>
+            {activeTask.progress.execution && <div className="mt-1 text-xs text-muted">
+              {activeTask.progress.execution.effective_mode === 'parallel_pilot' ? '受控并行' : activeTask.progress.execution.effective_mode === 'pipelined' ? '流水线加速' : '安全串行'}
+              {typeof activeTask.progress.execution.active_workers === 'number' && ` · ${activeTask.progress.execution.active_workers} 个采集工作者`}
+              {typeof activeTask.progress.execution.active_browser_targets === 'number' && ` · 浏览器标签 ${activeTask.progress.execution.active_browser_targets}/${activeTask.progress.execution.browser_target_limit || 1}`}
+              {activeTask.progress.execution.degraded && ` · 已降级：${activeTask.progress.execution.degradation_reason || '已回到安全模式'}`}
+            </div>}
             <div className="mt-3 grid gap-2 md:grid-cols-2">
               {Object.entries(activeTask.progress.platforms).map(([platform, state]) => (
                 <div key={platform} className="rounded-xl border border-card-border bg-white p-3 text-sm">
@@ -277,8 +294,26 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
         </div>
 
         <div className="mt-4 rounded-2xl border border-card-border bg-[#FFFCFA] p-4">
-          <div className="flex items-center justify-between gap-3"><div><div className="text-sm font-black">执行顺序</div><p className="mt-1 text-xs text-muted">平台串行采集；智联和前程无忧暂不执行发送或监听。</p></div><div className="flex gap-2">{enabledOrder.map((platform, index) => <div key={platform} className="flex items-center gap-1 rounded-full bg-white px-3 py-1 text-xs font-black text-primary"><span>{index + 1}. {platform === 'boss' ? 'BOSS' : platform === 'zhilian' ? '智联' : '51job'}</span><button type="button" onClick={() => move(platform, -1)} disabled={index === 0} aria-label="上移"><ArrowUp className="h-3 w-3" /></button><button type="button" onClick={() => move(platform, 1)} disabled={index === enabledOrder.length - 1} aria-label="下移"><ArrowDown className="h-3 w-3" /></button></div>)}</div></div>
+          <div className="flex items-center justify-between gap-3"><div><div className="text-sm font-black">执行顺序</div><p className="mt-1 text-xs text-muted">BOSS 是独占阶段；智联和前程无忧只采集与评分，不进入发送或监听。</p></div><div className="flex gap-2">{enabledOrder.map((platform, index) => <div key={platform} className="flex items-center gap-1 rounded-full bg-white px-3 py-1 text-xs font-black text-primary"><span>{index + 1}. {platform === 'boss' ? 'BOSS' : platform === 'zhilian' ? '智联' : '51job'}</span><button type="button" onClick={() => move(platform, -1)} disabled={index === 0} aria-label="上移"><ArrowUp className="h-3 w-3" /></button><button type="button" onClick={() => move(platform, 1)} disabled={index === enabledOrder.length - 1} aria-label="下移"><ArrowDown className="h-3 w-3" /></button></div>)}</div></div>
         </div>
+
+        {mode === 'collect' && <div className="mt-4 rounded-2xl border border-card-border bg-white p-4">
+          <label className="block text-sm font-black">采集速度
+            <Select className="mt-2" value={executionMode} onChange={event => setExecutionMode(event.target.value as ExecutionMode)}>
+              <option value="safe_serial">安全串行</option>
+              <option value="pipelined" disabled={!autoScore}>流水线加速（采集期间评分）</option>
+              <option value="parallel_pilot" disabled={!parallelPilotEnabled || !drafts.zhilian.enabled || !drafts['51job'].enabled}>受控并行（智联 + 51job）</option>
+            </Select>
+          </label>
+          <p className="mt-2 text-xs leading-5 text-muted">
+            {executionMode === 'parallel_pilot'
+              ? '仅在服务端试点开启且同时选择智联和前程无忧时生效，最多两个采集工作者；BOSS 不会并行。'
+              : executionMode === 'pipelined'
+                ? '已入库岗位会在后续平台采集期间进行 AI 评分，不增加浏览器访问频率。'
+                : '按队列逐个平台采集，兼容所有平台与既有风控策略。'}
+          </p>
+          {!parallelPilotEnabled && <p className="mt-1 text-xs text-muted">受控并行当前未开放，会自动保留为安全模式。</p>}
+        </div>}
 
         <label className="mt-4 flex items-center justify-between rounded-2xl border border-card-border bg-white p-4"><div><div className="text-sm font-black">{mode === 'full' ? '全流程自动评分' : '采集后自动评分'}</div><p className="mt-1 text-xs leading-5 text-muted">{mode === 'full' ? '全流程必须先评分；评分后进入人工确认，再按平台适配器执行招呼和监测。' : '默认关闭；开启后只评分本轮新增岗位，评分结束即停止，不发送消息、不投递、不监测。'}</p></div><Switch checked={mode === 'full' || autoScore} onChange={mode === 'full' ? () => undefined : setAutoScore} disabled={mode === 'full'} /></label>
         {error && <div className="mt-3 rounded-xl bg-red-50 px-3 py-2 text-sm text-danger">{error}</div>}

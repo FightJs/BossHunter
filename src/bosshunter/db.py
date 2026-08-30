@@ -44,6 +44,7 @@ def get_db(db_path: Path | None = None) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path))
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA journal_mode=WAL")
     _init_tables(conn)
     return conn
@@ -154,7 +155,12 @@ def job_identity_exists(
     return False
 
 
-def _normalize_job_ids(job_ids: Any, *, required: bool = False) -> list[str]:
+def _normalize_job_ids(
+    job_ids: Any,
+    *,
+    required: bool = False,
+    max_count: int | None = MAX_JOB_IDS,
+) -> list[str]:
     if isinstance(job_ids, (str, bytes, dict)) or job_ids is None:
         values = [] if job_ids is None else None
     else:
@@ -171,8 +177,8 @@ def _normalize_job_ids(job_ids: Any, *, required: bool = False) -> list[str]:
         job_id = value.strip()
         if job_id and job_id not in normalized:
             normalized.append(job_id)
-    if len(normalized) > MAX_JOB_IDS:
-        raise ValueError(f"一次最多处理 {MAX_JOB_IDS} 个岗位")
+    if max_count is not None and len(normalized) > max_count:
+        raise ValueError(f"一次最多处理 {max_count} 个岗位")
     if required and not normalized:
         raise ValueError("岗位 ID 不能为空")
     return normalized
@@ -407,6 +413,75 @@ def permanent_delete_jobs(
         if cursor.rowcount != len(ids):
             raise JobDeletionConflictError("永久删除数量校验失败，事务已回滚")
     return {"requested_count": len(ids), "affected_count": len(ids)}
+
+
+def clear_active_jobs(
+    conn: sqlite3.Connection,
+    *,
+    job_ids: Any = None,
+    confirmed: bool = False,
+    confirmation: str = "",
+) -> dict[str, Any]:
+    """Permanently remove eligible active jobs so they can be collected again.
+
+    Jobs with delivery/reply evidence remain in the pool and are returned in
+    ``blocked`` so a pool reset cannot erase an existing conversation record.
+    """
+    if confirmed is not True or confirmation != "CLEAR_JOB_POOL":
+        raise JobDeletionConfirmationError("清空岗位池需要 confirmed=true 和 confirmation=CLEAR_JOB_POOL")
+
+    if job_ids is None:
+        rows, _ = query_jobs(conn, deleted="active")
+    else:
+        normalized_ids = _normalize_job_ids(job_ids, max_count=None)
+        if not normalized_ids:
+            rows = []
+        else:
+            rows = []
+            for start in range(0, len(normalized_ids), 500):
+                rows.extend(
+                    row for row in _job_rows_by_ids(conn, normalized_ids[start:start + 500])
+                    if row.get("deleted_at") is None
+                )
+    job_ids = {str(row["id"]) for row in rows}
+    run_conflicts = _scoring_run_conflicts(conn, job_ids)
+    if run_conflicts:
+        raise JobDeletionConflictError("岗位仍被评分任务引用，请先结束该评分任务", blocked=run_conflicts)
+
+    blocked: list[dict[str, Any]] = []
+    eligible_ids: list[str] = []
+    for row in rows:
+        job_id = str(row["id"])
+        reasons: list[str] = []
+        if str(row.get("status") or "") in DELETION_PROTECTED_STATUSES:
+            reasons.append(f"当前状态为 {row['status']}")
+        reasons.extend(_history_protection_reasons(conn, job_id))
+        if reasons:
+            blocked.append({"job_id": job_id, "reasons": reasons})
+        else:
+            eligible_ids.append(job_id)
+
+    if eligible_ids:
+        with conn:
+            deleted_count = 0
+            for start in range(0, len(eligible_ids), 500):
+                chunk = eligible_ids[start:start + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                conn.execute(f"DELETE FROM history WHERE job_id IN ({placeholders})", chunk)
+                cursor = conn.execute(
+                    f"DELETE FROM jobs WHERE id IN ({placeholders}) AND deleted_at IS NULL",
+                    chunk,
+                )
+                deleted_count += cursor.rowcount
+            if deleted_count != len(eligible_ids):
+                raise JobDeletionConflictError("清空岗位池数量校验失败，事务已回滚")
+
+    return {
+        "requested_count": len(rows),
+        "affected_count": len(eligible_ids),
+        "protected_count": len(blocked),
+        "blocked": blocked,
+    }
 
 
 def insert_job_if_new(conn: sqlite3.Connection, job: dict[str, Any]) -> bool:

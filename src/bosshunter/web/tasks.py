@@ -21,7 +21,7 @@ MODE_LABELS = {
 }
 
 TERMINAL_STATUSES = {"completed", "failed", "stopped"}
-ACTIVE_STATUSES = {"running", "stopping"}
+ACTIVE_STATUSES = {"running", "stopping", "pausing"}
 DEADLINE_MODES = {"full", "monitor", "deliver"}
 
 
@@ -42,6 +42,7 @@ class WorkbenchTask:
     deadline_at: str | None = None
     stop_reason: str | None = None
     stop_requested: Event = field(default_factory=Event, repr=False)
+    pause_requested: Event = field(default_factory=Event, repr=False)
     metrics: dict[str, int] = field(default_factory=dict)
     progress: dict[str, Any] = field(default_factory=dict)
     context: dict[str, Any] = field(default_factory=dict, repr=False)
@@ -59,8 +60,11 @@ class WorkbenchTask:
             "deadline_at": self.deadline_at,
             "stop_reason": self.stop_reason,
             "stop_requested": self.stop_requested.is_set(),
+            "pause_requested": self.pause_requested.is_set(),
+            "can_resume": self.status == "paused",
             "metrics": dict(self.metrics),
             "progress": dict(self.progress),
+            "checkpoint": dict(self.context.get("checkpoint", {})),
         }
 
 
@@ -107,6 +111,9 @@ class WorkbenchTaskRunner:
                 )
 
             task = WorkbenchTask(id=str(uuid4()), mode=mode, label=MODE_LABELS[mode])
+            # Keep the task-start configuration available for a later resume.
+            # Runtime-only hooks/events are replaced by the executor on each run.
+            task.context["resume_config"] = dict(config)
             deadline = _deadline_from_config(mode, config)
             if deadline:
                 task.deadline_at = deadline.isoformat(timespec="seconds")
@@ -148,6 +155,16 @@ class WorkbenchTaskRunner:
                 raise KeyError(task_id)
             if task.status in TERMINAL_STATUSES:
                 return task.snapshot()
+            if task.status == "paused":
+                task.pause_requested.clear()
+                task.stop_requested.set()
+                task.status = "stopped"
+                task.stop_reason = reason
+                if reason and (not task.logs or task.logs[-1] != reason):
+                    task.logs.append(reason)
+                task.updated_at = datetime.now().isoformat(timespec="seconds")
+                return task.snapshot()
+            task.pause_requested.clear()
             task.stop_requested.set()
             task.status = "stopping"
             task.stop_reason = reason
@@ -162,6 +179,50 @@ class WorkbenchTaskRunner:
                 monitor_wakeup_event.set()
             return task.snapshot()
 
+    def pause(self, task_id: str, reason: str = "用户已请求暂停") -> dict:
+        """Cooperatively stop at the next safe checkpoint and retain the task."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                raise KeyError(task_id)
+            if task.status == "paused":
+                return task.snapshot()
+            if task.status in TERMINAL_STATUSES:
+                return task.snapshot()
+            task.pause_requested.set()
+            task.stop_requested.set()
+            task.status = "pausing"
+            task.stop_reason = reason
+            if reason and (not task.logs or task.logs[-1] != reason):
+                task.logs.append(reason)
+            task.updated_at = datetime.now().isoformat(timespec="seconds")
+            self._wake_task(task)
+            return task.snapshot()
+
+    def resume(self, task_id: str, config: dict | None = None) -> dict:
+        """Restart a paused task using its checkpoint and latest safe settings."""
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                raise KeyError(task_id)
+            if task.status != "paused":
+                raise ValueError("只有已暂停的任务可以继续")
+            if self._active_task_locked():
+                raise TaskAlreadyRunningError("当前已有后台任务正在运行或停止中，请等待其完全结束")
+            runtime_config = config if isinstance(config, dict) else task.context.get("resume_config", {})
+            task.context["resume_config"] = dict(runtime_config)
+            task.context["resume_requested"] = True
+            task.pause_requested.clear()
+            task.stop_requested.clear()
+            task.stop_reason = None
+            task.error = None
+            task.status = "running"
+            task.updated_at = datetime.now().isoformat(timespec="seconds")
+            thread = Thread(target=self._run, args=(task, runtime_config), daemon=True)
+            self._threads[task.id] = thread
+            thread.start()
+            return task.snapshot()
+
     def wait(self, timeout: float | None = None) -> None:
         threads = list(self._threads.values())
         for thread in threads:
@@ -173,14 +234,21 @@ class WorkbenchTaskRunner:
             if executor:
                 executor(task, config)
             with self._lock:
-                if task.stop_requested.is_set():
+                if task.pause_requested.is_set():
+                    task.status = "paused"
+                    task.stop_reason = task.stop_reason or "任务已暂停，可从断点继续"
+                elif task.stop_requested.is_set():
                     task.status = "stopped"
                 else:
                     task.status = "completed"
                 task.updated_at = datetime.now().isoformat(timespec="seconds")
         except Exception as exc:
             with self._lock:
-                if task.stop_requested.is_set():
+                if task.pause_requested.is_set():
+                    task.status = "paused"
+                    task.error = None
+                    task.stop_reason = task.stop_reason or "任务已暂停，可从断点继续"
+                elif task.stop_requested.is_set():
                     task.status = "stopped"
                     task.error = None
                 else:
@@ -204,6 +272,13 @@ class WorkbenchTaskRunner:
             if task.status in ACTIVE_STATUSES:
                 return task
         return None
+
+    @staticmethod
+    def _wake_task(task: WorkbenchTask) -> None:
+        for key in ("confirmation_event", "monitor_wakeup_event"):
+            event = task.context.get(key)
+            if isinstance(event, Event):
+                event.set()
 
 
 def _deadline_from_config(mode: str, config: dict) -> datetime | None:

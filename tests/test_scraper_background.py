@@ -71,9 +71,9 @@ class ScraperBackgroundTests(unittest.TestCase):
         collected_job_ids = []
         jobs = [
             {"title": "Existing", "company": "Example", "salary": "10-15K", "experience": "", "url": "/job_detail/existing.html"},
-            {"title": "New", "company": "Example", "salary": "10-15K", "experience": "", "url": "/job_detail/new.html"},
+            {"title": "AI New", "company": "Example", "salary": "10-15K", "experience": "", "url": "/job_detail/new.html"},
         ]
-        detail = {"title": "New", "company": "Example", "salary": "10-15K", "jd": "客户交付"}
+        detail = {"title": "AI New", "company": "Example", "salary": "10-15K", "jd": "负责 AI 客户交付"}
         config = {
             "profile": {"target_cities": ["北京"], "deal_breakers": []},
             "search": {"max_pages": 1},

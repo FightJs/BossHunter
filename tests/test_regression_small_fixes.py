@@ -342,6 +342,38 @@ class PrefilterHardGateTests(unittest.TestCase):
         self.assertEqual(score, 0)
         self.assertEqual(reason, "薪资低于硬性要求: 12K < 100K")
 
+    def test_salary_range_uses_minimum_for_hard_gate(self):
+        from bosshunter.ai.prefilter import quick_score
+
+        config = {"profile": {"deal_breakers": [], "salary_min": 15, "salary_max": 25}}
+
+        score, reason = quick_score(
+            {"title": "AI产品经理", "jd": "", "salary": "12-30K"},
+            config,
+        )
+
+        self.assertEqual(score, 0)
+        self.assertEqual(reason, "薪资低于硬性要求: 12K < 15K")
+
+        score, reason = quick_score(
+            {"title": "AI产品经理", "jd": "", "salary": "26-40K"},
+            config,
+        )
+
+        self.assertEqual(score, 0)
+        self.assertEqual(reason, "薪资高于期望上限: 26K > 25K")
+
+    def test_zhaopin_yuan_salary_range_uses_k_for_hard_gate(self):
+        from bosshunter.ai.prefilter import quick_score
+
+        score, reason = quick_score(
+            {"title": "AI产品经理", "jd": "", "salary": "8000-11000元"},
+            {"profile": {"deal_breakers": [], "salary_min": 0, "salary_max": 30}},
+        )
+
+        self.assertEqual(score, 100)
+        self.assertEqual(reason, "预筛通过")
+
     def test_passing_job_returns_hard_gate_pass(self):
         from bosshunter.ai.prefilter import quick_score
 

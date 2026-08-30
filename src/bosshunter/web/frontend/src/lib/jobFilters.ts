@@ -45,16 +45,29 @@ export function hasActiveJobFilters(filters: JobFilters) {
   return Object.values(filters).some(value => value !== '')
 }
 
+const MONTHLY_SALARY_UNIT = '[kK万千]|元(?:\\s*\\/\\s*月)?'
+
+function salaryValueK(value: number, unit: string | undefined): number {
+  const normalizedUnit = (unit || '').replace(/\s+/g, '').toLowerCase()
+  if (normalizedUnit === '' || normalizedUnit === 'k' || normalizedUnit === '千') return value
+  if (normalizedUnit === '万') return value * 10
+  return value / 1000
+}
+
 function parseMonthlySalaryK(salary: string): [number, number] | null {
-  const range = salary.match(/(\d+(?:\.\d+)?)\s*[kK]?\s*-\s*(\d+(?:\.\d+)?)\s*[kK]/)
+  if (/元\s*\/\s*(?:天|日|小时|时)/i.test(salary)) return null
+  const range = salary.match(new RegExp(
+    `(\\d+(?:\\.\\d+)?)\\s*(${MONTHLY_SALARY_UNIT})?\\s*[-至~～]\\s*`
+      + `(\\d+(?:\\.\\d+)?)\\s*(${MONTHLY_SALARY_UNIT})?`,
+  ))
   if (range) {
-    const low = Number(range[1])
-    const high = Number(range[2])
+    const low = salaryValueK(Number(range[1]), range[2] || range[4])
+    const high = salaryValueK(Number(range[3]), range[4])
     return [Math.min(low, high), Math.max(low, high)]
   }
-  const single = salary.match(/(\d+(?:\.\d+)?)\s*[kK](?!\w)/)
+  const single = salary.match(new RegExp(`(\\d+(?:\\.\\d+)?)\\s*(${MONTHLY_SALARY_UNIT})(?!\\w)`))
   if (single) {
-    const value = Number(single[1])
+    const value = salaryValueK(Number(single[1]), single[2])
     return [value, value]
   }
   return null

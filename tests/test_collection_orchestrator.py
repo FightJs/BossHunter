@@ -1,6 +1,6 @@
 import tempfile
 from pathlib import Path
-from threading import Event
+from threading import Barrier, Event
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -134,6 +134,28 @@ class CollectionOrchestratorTests(TestCase):
                 )
         score_jobs.assert_not_called()
 
+    def test_source_search_keyword_must_match_title_or_jd_before_saving(self):
+        unmatched = _candidate("zhilian", "unmatched", "汽车展厅经理")
+        unmatched.source_keyword = "agent"
+        unmatched.jd = "负责客户接待和展厅运营"
+        matched = _candidate("zhilian", "matched", "AI Agent Engineer")
+        matched.source_keyword = "agent"
+        registry = CollectorRegistry({"zhilian": lambda: _FakeCollector("zhilian", [], [unmatched, matched])})
+        options = _options(order=["zhilian"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "collection.db"
+            result = CollectionOrchestrator({}, db_path=db_path, registry=registry).run(options)
+            db = get_db(db_path)
+            try:
+                rows = db.execute("SELECT id FROM jobs ORDER BY id").fetchall()
+            finally:
+                db.close()
+
+        self.assertEqual(result["platforms"]["zhilian"]["filtered"], 1)
+        self.assertEqual(result["collected_job_ids"], ["zhilian:matched"])
+        self.assertEqual([row["id"] for row in rows], ["zhilian:matched"])
+
     def test_stop_event_does_not_start_the_next_platform_or_scoring(self):
         events = []
         stop_event = Event()
@@ -198,3 +220,115 @@ class CollectionOrchestratorTests(TestCase):
             "platforms": {"zhilian": {"enabled": False, "search": {}}},
         })
         self.assertEqual(result["platform_order"], ["boss"])
+
+    def test_parallel_pilot_runs_only_the_non_boss_stage_concurrently(self):
+        barrier = Barrier(2)
+        started: list[str] = []
+
+        class ParallelCollector:
+            def __init__(self, platform: str):
+                self.platform = platform
+
+            def collect(self, _request, hooks: CollectorHooks):
+                started.append(self.platform)
+                barrier.wait(timeout=1)
+                candidate = _candidate(self.platform, f"{self.platform}-new")
+                if hooks.on_list_candidate(candidate):
+                    hooks.on_candidate(candidate)
+                return PlatformCollectionResult(self.platform, "completed", "search_exhausted", "完成")
+
+        registry = CollectorRegistry({
+            "zhilian": lambda: ParallelCollector("zhilian"),
+            "51job": lambda: ParallelCollector("51job"),
+        })
+        options = _options(order=["zhilian", "51job"])
+        options["execution_mode"] = "parallel_pilot"
+        config = {"collection": {"parallel_pilot_enabled": True, "max_browser_targets": 3}}
+        with tempfile.TemporaryDirectory() as tmp:
+            result = CollectionOrchestrator(config, db_path=Path(tmp) / "collection.db", registry=registry).run(options)
+
+        self.assertEqual(set(started), {"zhilian", "51job"})
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["execution"]["effective_mode"], "parallel_pilot")
+        self.assertEqual(set(result["collected_job_ids"]), {"zhilian:zhilian-new", "51job:51job-new"})
+
+    def test_pipelined_scoring_starts_while_the_next_platform_collects(self):
+        score_started = Event()
+
+        class BossCollectorFixture:
+            platform = "boss"
+
+            def collect(self, _request, hooks: CollectorHooks):
+                candidate = _candidate("boss", "boss-new")
+                if hooks.on_list_candidate(candidate):
+                    hooks.on_candidate(candidate)
+                return PlatformCollectionResult("boss", "completed", "search_exhausted", "完成")
+
+        class ZhilianCollectorFixture:
+            platform = "zhilian"
+
+            def collect(self, _request, hooks: CollectorHooks):
+                if not score_started.wait(1):
+                    return PlatformCollectionResult("zhilian", "failed", "score_not_started", "评分流水线未启动")
+                candidate = _candidate("zhilian", "zhilian-new")
+                if hooks.on_list_candidate(candidate):
+                    hooks.on_candidate(candidate)
+                return PlatformCollectionResult("zhilian", "completed", "search_exhausted", "完成")
+
+        registry = CollectorRegistry({
+            "boss": BossCollectorFixture,
+            "zhilian": ZhilianCollectorFixture,
+        })
+        options = _options(order=["boss", "zhilian"], auto_score=True)
+        options["execution_mode"] = "pipelined"
+        config = {"collection": {"score_batch_size": 1, "score_flush_ms": 50}}
+        with tempfile.TemporaryDirectory() as tmp, patch("bosshunter.ai.scorer.score_jobs", side_effect=lambda *_args, **_kwargs: score_started.set() or (1, 0)):
+            result = CollectionOrchestrator(config, db_path=Path(tmp) / "collection.db", registry=registry).run(options)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertTrue(score_started.is_set())
+
+    def test_parallel_pilot_falls_back_when_the_release_guard_is_disabled(self):
+        options = _options(order=["zhilian", "51job"])
+        options["execution_mode"] = "parallel_pilot"
+        normalized = normalize_collection_options({"collection": {"parallel_pilot_enabled": False}}, options)
+        self.assertEqual(normalized["execution_mode"], "parallel_pilot")
+        registry = CollectorRegistry({
+            "zhilian": lambda: _FakeCollector("zhilian", [], []),
+            "51job": lambda: _FakeCollector("51job", [], []),
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            result = CollectionOrchestrator({"collection": {"parallel_pilot_enabled": False}}, db_path=Path(tmp) / "collection.db", registry=registry).run(options)
+        self.assertEqual(result["execution"]["effective_mode"], "safe_serial")
+        self.assertTrue(result["execution"]["degraded"])
+
+    def test_parallel_pilot_preserves_a_blocked_platform_outcome(self):
+        barrier = Barrier(2)
+
+        class BlockingCollector:
+            platform = "zhilian"
+
+            def collect(self, _request, _hooks: CollectorHooks):
+                barrier.wait(timeout=1)
+                return PlatformCollectionResult("zhilian", "blocked", "rate_limit", "智联限流")
+
+        class CancelledCollector:
+            platform = "51job"
+
+            def collect(self, _request, hooks: CollectorHooks):
+                barrier.wait(timeout=1)
+                hooks.stop_event.wait(1)
+                return PlatformCollectionResult("51job", "stopped", "user_stopped", "同阶段已取消")
+
+        registry = CollectorRegistry({"zhilian": BlockingCollector, "51job": CancelledCollector})
+        options = _options(order=["zhilian", "51job"])
+        options["execution_mode"] = "parallel_pilot"
+        with tempfile.TemporaryDirectory() as tmp:
+            result = CollectionOrchestrator(
+                {"collection": {"parallel_pilot_enabled": True}},
+                db_path=Path(tmp) / "collection.db",
+                registry=registry,
+            ).run(options)
+
+        self.assertEqual(result["status"], "completed_with_errors")
+        self.assertEqual(next(item for item in result["results"] if item["platform"] == "zhilian")["reason_code"], "rate_limit")

@@ -30,6 +30,7 @@ from bosshunter.db import (
 	JobDeletionConflictError,
 	JobManualSentConflictError,
 	add_history,
+	clear_active_jobs,
 	count_unresolved_monitor_items,
 	get_active_platform_safety_lock,
 	get_daily_activity,
@@ -316,6 +317,11 @@ def _log(task: WorkbenchTask, message: str) -> None:
 	task.logs.append(message)
 
 
+def _set_checkpoint(task: WorkbenchTask, stage: str, **details) -> None:
+	"""Record the last safe workbench boundary for pause/resume."""
+	task.context["checkpoint"] = {"stage": stage, **details}
+
+
 def _record_collect_progress(task: WorkbenchTask, state: dict) -> None:
 	task.metrics.update({
 		"collect_seen": int(state.get("seen") or 0),
@@ -345,9 +351,14 @@ def _record_score_progress(task: WorkbenchTask, state: dict) -> None:
 
 
 def _execute_collect(task: WorkbenchTask, config: dict) -> None:
+	previous_checkpoint = task.context.get("checkpoint")
+	_set_checkpoint(task, "collect")
 	_log(task, "开始采集岗位")
 	collect_config = dict(config)
 	collect_config["_workbench_stop_event"] = task.stop_requested
+	collect_config["_workbench_pause_event"] = task.pause_requested
+	if isinstance(previous_checkpoint, dict) and previous_checkpoint.get("run_id"):
+		collect_config["_workbench_resume_run_id"] = str(previous_checkpoint["run_id"])
 	collect_config["_workbench_collect_progress"] = lambda state: _record_collect_progress(task, state)
 	if "_collection_options" not in config:
 		# Preserve the old private executor seam used by legacy callers. New Web
@@ -381,7 +392,9 @@ def _execute_collect(task: WorkbenchTask, config: dict) -> None:
 		"outcome": result.get("status", "completed"),
 		"platforms": result.get("platforms", {}),
 		"collected_job_ids": result.get("collected_job_ids", []),
+		"execution": result.get("execution", {}),
 	}
+	_set_checkpoint(task, "collect_complete", run_id=result.get("run_id", ""))
 	boss_state = result.get("platforms", {}).get("boss", {})
 	if isinstance(boss_state, dict):
 		_stop_or_log_boss_collection_reason(task, str(boss_state.get("reason_code") or ""))
@@ -422,6 +435,7 @@ def _execute_rescore(task: WorkbenchTask, config: dict) -> None:
 	score_config["_workbench_stop_event"] = task.stop_requested
 	score_config["_workbench_log"] = lambda message: _log(task, message)
 	score_config["_workbench_score_progress"] = lambda state: _record_score_progress(task, state)
+	_set_checkpoint(task, "rescore")
 	_log(task, "开始重新评分")
 	score_jobs(score_config, rescore_filtered=True)
 
@@ -453,6 +467,7 @@ def _execute_score(task: WorkbenchTask, config: dict) -> None:
 	score_config["_workbench_log"] = lambda message: _log(task, message)
 	score_config["_workbench_score_progress"] = lambda state: _record_score_progress(task, state)
 	score_config["_workbench_score_checkpoint"] = checkpoint
+	_set_checkpoint(task, "score", run_id=run_id)
 	_log(task, f"开始单独 AI 评分：{len(options.get('job_ids', []))} 个岗位")
 	try:
 		score_jobs(
@@ -510,6 +525,7 @@ def _execute_monitor(task: WorkbenchTask, config: dict, *, initial_cooldown: boo
 		get_effective_monitor_interval_minutes,
 		monitor_and_send_resumes,
 	)
+	_set_checkpoint(task, "monitor")
 	if _stop_for_active_platform_lock(task):
 		return
 
@@ -562,6 +578,26 @@ def _execute_monitor(task: WorkbenchTask, config: dict, *, initial_cooldown: boo
 
 
 def _execute_full(task: WorkbenchTask, config: dict) -> None:
+	checkpoint = task.context.get("checkpoint")
+	stage = checkpoint.get("stage") if isinstance(checkpoint, dict) else ""
+	if task.context.pop("resume_requested", False):
+		_log(task, "从上次暂停的断点继续执行")
+
+	if stage == "monitor":
+		_execute_monitor(task, load_config(CONFIG_PATH), initial_cooldown=False)
+		return
+
+	if stage == "deliver":
+		job_ids = [str(job_id) for job_id in checkpoint.get("job_ids", []) if str(job_id)]
+		if job_ids:
+			deliver_config = load_config(CONFIG_PATH)
+			deliver_config["_workbench_job_ids"] = job_ids
+			_execute_deliver(task, deliver_config)
+			if task.stop_requested.is_set():
+				return
+		_execute_monitor(task, load_config(CONFIG_PATH), initial_cooldown=True)
+		return
+
 	db = _get_web_db()
 	try:
 		deferred_job_ids = [str(job["id"]) for job in get_jobs_ready_to_send(db)]
@@ -576,24 +612,25 @@ def _execute_full(task: WorkbenchTask, config: dict) -> None:
 		if task.stop_requested.is_set():
 			return
 
-	full_collection_config = dict(config)
-	try:
-		configured_options = full_collection_config.get("_collection_options")
-		if not isinstance(configured_options, dict):
-			configured_options = normalize_collection_options(full_collection_config, None)
-		full_collection_config["_collection_options"] = {
-			**configured_options,
-			"auto_score": True,
-		}
-	except ValueError as exc:
-		if "不支持已启用的智联招聘" in str(exc):
-			raise
-		# Keep the legacy executor path available for callers/tests that supply
-		# an intentionally minimal config and replace collection externally.
-		full_collection_config.pop("_collection_options", None)
-	_execute_collect(task, full_collection_config)
-	if task.stop_requested.is_set():
-		return
+	if stage != "waiting_confirmation":
+		full_collection_config = dict(config)
+		try:
+			configured_options = full_collection_config.get("_collection_options")
+			if not isinstance(configured_options, dict):
+				configured_options = normalize_collection_options(full_collection_config, None)
+			full_collection_config["_collection_options"] = {
+				**configured_options,
+				"auto_score": True,
+			}
+		except ValueError as exc:
+			if "不支持已启用的智联招聘" in str(exc):
+				raise
+			# Keep the legacy executor path available for callers/tests that supply
+			# an intentionally minimal config and replace collection externally.
+			full_collection_config.pop("_collection_options", None)
+		_execute_collect(task, full_collection_config)
+		if task.stop_requested.is_set():
+			return
 
 	db = _get_web_db()
 	try:
@@ -613,6 +650,7 @@ def _execute_full(task: WorkbenchTask, config: dict) -> None:
 	confirmation_event = Event()
 	task.context["confirmation_event"] = confirmation_event
 	task.context["waiting_confirmation"] = True
+	_set_checkpoint(task, "waiting_confirmation")
 	if task.context.get("delivery_requested"):
 		confirmation_event.set()
 	_log(task, "等待前端确认投递")
@@ -636,6 +674,7 @@ def _execute_full(task: WorkbenchTask, config: dict) -> None:
 	# jobs. Reload immediately before delivery instead of using the task-start snapshot.
 	deliver_config = load_config(CONFIG_PATH)
 	deliver_config["_workbench_job_ids"] = job_ids
+	_set_checkpoint(task, "deliver", job_ids=job_ids)
 	_execute_deliver(task, deliver_config)
 	if task.stop_requested.is_set():
 		return
@@ -1020,8 +1059,8 @@ def api_job_search():
 				salary_range = parse_monthly_salary_k(row.get("salary", ""))
 				if salary_range is None:
 					continue
-				job_min, job_max = salary_range
-				if salary_min is not None and job_max < salary_min:
+				job_min, _job_max = salary_range
+				if salary_min is not None and job_min < salary_min:
 					continue
 				if salary_max is not None and job_min > salary_max:
 					continue
@@ -1355,6 +1394,7 @@ def api_workbench_task_start():
 				**(base_config.get("collection") if isinstance(base_config.get("collection"), dict) else {}),
 				"default_order": collection_options["platform_order"],
 				"auto_score_default": collection_options["auto_score"],
+				"execution_mode": collection_options.get("execution_mode", "safe_serial"),
 			}
 			platform_configs = deepcopy(base_config.get("platforms")) if isinstance(base_config.get("platforms"), dict) else {}
 			selected_platforms = set(collection_options["platform_order"])
@@ -1399,6 +1439,73 @@ def api_collection_run_detail(run_id):
 def api_workbench_task_stop(task_id):
 	try:
 		return _json_response(task_runner.stop(task_id))
+	except KeyError:
+		return _json_response({"error": "任务不存在"}, 404)
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/workbench/task/<task_id>/pause", method="POST")
+def api_workbench_task_pause(task_id):
+	try:
+		return _json_response(task_runner.pause(task_id))
+	except KeyError:
+		return _json_response({"error": "任务不存在"}, 404)
+	except Exception as e:
+		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/workbench/task/<task_id>/resume", method="POST")
+def api_workbench_task_resume(task_id):
+	try:
+		body = request.json or {}
+		if not isinstance(body, dict):
+			return _json_response({"error": "请求体必须是对象"}, 400)
+		stored_task = task_runner._tasks.get(task_id)
+		if stored_task is None:
+			return _json_response({"error": "任务不存在"}, 404)
+		config = load_config(CONFIG_PATH)
+		# Keep the exact normalized selection from the paused run unless the
+		# caller explicitly supplies replacement collection settings.
+		previous = stored_task.context.get("resume_config")
+		if isinstance(previous, dict):
+			# Restore executor-private run/checkpoint arguments (score run ID,
+			# selected job IDs, normalized collection options) while taking all
+			# user-editable settings from the current config.yaml.
+			for key, value in previous.items():
+				if str(key).startswith("_") and key not in {"_workbench_stop_event", "_workbench_pause_event"}:
+					config[key] = value
+		options = body.get("options") if isinstance(body.get("options"), dict) else None
+		if options is not None and stored_task.mode in {"collect", "full"}:
+			try:
+				collection_options = normalize_collection_options(config, options)
+			except ValueError as exc:
+				return _json_response({"error": str(exc)}, 400)
+			if stored_task.mode == "full":
+				collection_options["auto_score"] = True
+			config["_collection_options"] = collection_options
+			# Settings changed during a pause are saved so the next restart/dialog
+			# sees the same values.
+			if collection_options is not None:
+				config.setdefault("collection", {})["default_order"] = collection_options["platform_order"]
+				config.setdefault("collection", {})["auto_score_default"] = collection_options["auto_score"]
+				config.setdefault("collection", {})["execution_mode"] = collection_options.get("execution_mode", "safe_serial")
+				platform_configs = deepcopy(config.get("platforms")) if isinstance(config.get("platforms"), dict) else {}
+				selected_platforms = set(collection_options["platform_order"])
+				for platform, value in collection_options["platforms"].items():
+					platform_configs[platform] = {
+						**(platform_configs.get(platform) if isinstance(platform_configs.get(platform), dict) else {}),
+						"enabled": platform in selected_platforms,
+						"search": value,
+					}
+				config["platforms"] = platform_configs
+				_write_config(config)
+		resumed = task_runner.resume(task_id, config)
+		return _json_response(resumed)
+	except TaskAlreadyRunningError as exc:
+		return _json_response({"error": str(exc)}, 409)
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 409)
 	except KeyError:
 		return _json_response({"error": "任务不存在"}, 404)
 	except Exception as e:
@@ -1895,6 +2002,118 @@ def _active_task_mutation_error():
 		"code": "active_task_conflict",
 		"task_id": active.get("id"),
 	}, 409)
+
+
+def _filtered_active_job_ids(db, filters: dict) -> list[str]:
+	"""Return every active job matching the dashboard's pool filters."""
+	keyword = str(filters.get("q") or "").strip()
+	minimum_score = filters.get("min_score")
+	salary_min = filters.get("salary_min")
+	salary_max = filters.get("salary_max")
+	status_filter = str(filters.get("status") or "").strip()
+	created_within = str(filters.get("created_within") or "").strip()
+	source_platform = str(filters.get("source_platform") or "").strip()
+	education_filter = str(filters.get("education") or "").strip()
+	recruitment_type = str(filters.get("recruitment_type") or "").strip()
+	if created_within not in {"", "today", "3d", "7d"}:
+		raise ValueError("created_within 参数无效")
+	if recruitment_type not in {"", "campus", "experienced", "unknown"}:
+		raise ValueError("recruitment_type 参数无效")
+	if source_platform not in {"", "boss", "zhilian", "51job"}:
+		raise ValueError("source_platform 参数无效")
+	if education_filter not in {"", "博士", "硕士", "本科", "大专", "不限", "其他", "unknown"}:
+		raise ValueError("education 参数无效")
+
+	def optional_float(value, name, *, minimum=0, maximum=None):
+		if value in (None, ""):
+			return None
+		try:
+			parsed = float(value)
+		except (TypeError, ValueError) as exc:
+			raise ValueError(f"{name} 必须是数字") from exc
+		if not math.isfinite(parsed) or parsed < minimum or (maximum is not None and parsed > maximum):
+			raise ValueError(f"{name} 超出允许范围")
+		return parsed
+
+	minimum_score = optional_float(minimum_score, "min_score", maximum=100)
+	salary_min = optional_float(salary_min, "salary_min")
+	salary_max = optional_float(salary_max, "salary_max")
+	if salary_min is not None and salary_max is not None and salary_min > salary_max:
+		raise ValueError("最低薪资不能高于最高薪资")
+	conditions = ["deleted_at IS NULL"]
+	params = []
+	if keyword:
+		conditions.append("(title LIKE ? OR company LIKE ? OR jd LIKE ? OR score_reason LIKE ?)")
+		params.extend([f"%{keyword}%"] * 4)
+	if minimum_score is not None:
+		conditions.append("score >= ?")
+		params.append(minimum_score)
+	if status_filter:
+		conditions.append("status = ?")
+		params.append(status_filter)
+	if source_platform:
+		conditions.append("COALESCE(source_platform, 'boss') = ?")
+		params.append(source_platform)
+	if recruitment_type:
+		conditions.append("COALESCE(recruitment_type, 'unknown') = ?")
+		params.append(recruitment_type)
+	if education_filter:
+		if education_filter == "unknown":
+			conditions.append("COALESCE(TRIM(education), '') = ''")
+		else:
+			conditions.append("education LIKE ?")
+			params.append(f"%{education_filter}%")
+	if created_within == "today":
+		conditions.append("created_at >= datetime('now', 'localtime', 'start of day', 'utc')")
+	elif created_within == "3d":
+		conditions.append("created_at >= datetime('now', '-3 days')")
+	elif created_within == "7d":
+		conditions.append("created_at >= datetime('now', '-7 days')")
+	query = "SELECT id, salary FROM jobs WHERE " + " AND ".join(conditions)
+	rows = [dict(row) for row in db.execute(query, params).fetchall()]
+	if salary_min is not None or salary_max is not None:
+		matched = []
+		for row in rows:
+			salary_range = parse_monthly_salary_k(row.get("salary", ""))
+			if salary_range is None:
+				continue
+			job_min, _job_max = salary_range
+			if salary_min is not None and job_min < salary_min:
+				continue
+			if salary_max is not None and job_min > salary_max:
+				continue
+			matched.append(row)
+		rows = matched
+	return [str(row["id"]) for row in rows]
+
+
+@app.route("/api/jobs/clear", method="POST")
+@app.route("/api/jobs/clear-pool", method="POST")
+def api_jobs_clear_pool():
+	db = _get_web_db()
+	try:
+		body = request.json or {}
+		if not isinstance(body, dict):
+			raise ValueError("请求体必须是对象")
+		filters = body.get("filters", {})
+		if not isinstance(filters, dict):
+			raise ValueError("filters 必须是对象")
+		with job_mutation_lock:
+			conflict = _active_task_mutation_error()
+			if conflict is not None:
+				return conflict
+			job_ids = _filtered_active_job_ids(db, filters)
+			result = clear_active_jobs(
+				db,
+				job_ids=job_ids,
+				confirmed=body.get("confirmed") is True,
+				confirmation=body.get("confirmation", ""),
+			)
+		return _json_response(result)
+	except (ValueError, JobDeletionConflictError) as exc:
+		return _job_action_error(exc)
+	finally:
+		db.close()
 
 
 @app.route("/api/jobs/soft-delete", method="POST")

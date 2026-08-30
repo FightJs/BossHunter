@@ -154,8 +154,8 @@ def _filtered_rows(conn: sqlite3.Connection, filters: dict[str, Any] | None = No
 		salary_range = parse_monthly_salary_k(str(row.get("salary") or ""))
 		if salary_range is None:
 			continue
-		job_minimum, job_maximum = salary_range
-		if minimum_salary is not None and job_maximum < minimum_salary:
+		job_minimum, _job_maximum = salary_range
+		if minimum_salary is not None and job_minimum < minimum_salary:
 			continue
 		if maximum_salary is not None and job_minimum > maximum_salary:
 			continue

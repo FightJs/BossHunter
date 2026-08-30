@@ -347,7 +347,7 @@ class WebApiRouteTests(unittest.TestCase):
             db = get_db(base_dir / "data" / "bosshunter.db")
             try:
                 matching = _job("matching")
-                matching.update({"title": "实施顾问", "salary": "5-8K", "jd": "负责 SQL 系统实施"})
+                matching.update({"title": "实施顾问", "salary": "8-13K", "jd": "负责 SQL 系统实施"})
                 insert_job(db, matching)
                 update_job_score(db, "matching", 82, "数据库技能匹配")
                 update_job_status(db, "matching", "ready")
@@ -413,8 +413,8 @@ class WebApiRouteTests(unittest.TestCase):
 
         payload = json.loads(body)
         self.assertTrue(status.startswith("200"), body)
-        self.assertEqual(payload["total"], 3)
-        self.assertEqual([job["id"] for job in payload["items"]], ["middle", "low"])
+        self.assertEqual(payload["total"], 2)
+        self.assertEqual([job["id"] for job in payload["items"]], ["middle"])
 
     def test_job_search_supports_whitelisted_column_sorting(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -948,6 +948,82 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertEqual(json.loads(workbench_body)["send_quota"]["sent"], 0)
         self.assertEqual(row["status"], "sent")
         self.assertEqual([item["action"] for item in history], ["manual_sent"])
+
+    def test_web_api_clear_job_pool_requires_confirmation_and_preserves_sent_jobs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("clear-api-safe"))
+                insert_job(db, _job("clear-api-protected"))
+                update_job_status(db, "clear-api-protected", "sent")
+                add_history(db, "clear-api-protected", "sent", "已发送")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            invalid_status, _, invalid_body = self._request(
+                "/api/jobs/clear",
+                method="POST",
+                json_body={"confirmed": True, "confirmation": "WRONG"},
+            )
+            status, _, body = self._request(
+                "/api/jobs/clear-pool",
+                method="POST",
+                json_body={"confirmed": True, "confirmation": "CLEAR_JOB_POOL"},
+            )
+            verify_db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                safe = verify_db.execute("SELECT 1 FROM jobs WHERE id = ?", ("clear-api-safe",)).fetchone()
+                protected = verify_db.execute("SELECT status FROM jobs WHERE id = ?", ("clear-api-protected",)).fetchone()
+            finally:
+                verify_db.close()
+
+        self.assertTrue(invalid_status.startswith("400"), invalid_body)
+        self.assertTrue(status.startswith("200"), body)
+        result = json.loads(body)
+        self.assertEqual(result["affected_count"], 1)
+        self.assertEqual(result["protected_count"], 1)
+        self.assertIsNone(safe)
+        self.assertEqual(protected["status"], "sent")
+
+    def test_web_api_clear_job_pool_only_removes_current_filtered_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                matching = _job("clear-filtered")
+                matching.update({"title": "Python 工程师", "status": "pending"})
+                outside = _job("clear-outside")
+                outside.update({"title": "产品经理", "status": "pending"})
+                insert_job(db, matching)
+                insert_job(db, outside)
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request(
+                "/api/jobs/clear",
+                method="POST",
+                json_body={
+                    "confirmed": True,
+                    "confirmation": "CLEAR_JOB_POOL",
+                    "filters": {"q": "Python"},
+                },
+            )
+            verify_db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                matching_row = verify_db.execute("SELECT 1 FROM jobs WHERE id = ?", ("clear-filtered",)).fetchone()
+                outside_row = verify_db.execute("SELECT 1 FROM jobs WHERE id = ?", ("clear-outside",)).fetchone()
+            finally:
+                verify_db.close()
+
+        self.assertTrue(status.startswith("200"), body)
+        result = json.loads(body)
+        self.assertEqual(result["requested_count"], 1)
+        self.assertEqual(result["affected_count"], 1)
+        self.assertIsNone(matching_row)
+        self.assertIsNotNone(outside_row)
 
     def test_web_api_deliver_rejects_already_sent_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:

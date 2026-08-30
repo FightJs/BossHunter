@@ -86,6 +86,14 @@ DEFAULTS: dict[str, Any] = {
     "collection": {
         "default_order": ["boss"],
         "auto_score_default": False,
+        "execution_mode": "safe_serial",
+        # A server-side guard for the experimental non-BOSS parallel scheduler.
+        # It intentionally stays disabled in user configs until it is released.
+        "parallel_pilot_enabled": False,
+        "max_non_boss_workers": 2,
+        "max_browser_targets": 3,
+        "score_batch_size": 5,
+        "score_flush_ms": 1000,
         "daily_search_page_limit": 30,
         "daily_detail_page_limit": 150,
         "max_consecutive_page_failures": 3,

@@ -58,8 +58,11 @@ export interface WorkbenchTask {
   deadline_at?: string
   stop_reason?: string
   stop_requested: boolean
+  pause_requested?: boolean
+  can_resume?: boolean
   metrics?: Record<string, number>
   progress?: CollectionProgress
+  checkpoint?: { stage?: string; [key: string]: unknown }
 }
 
 export interface CollectionPlatformProgress {
@@ -89,6 +92,20 @@ export interface CollectionProgress {
   platform_total?: number
   platforms?: Record<string, CollectionPlatformProgress>
   collected_job_ids?: string[]
+  execution?: CollectionExecutionProgress
+}
+
+export interface CollectionExecutionProgress {
+  requested_mode?: 'safe_serial' | 'pipelined' | 'parallel_pilot' | string
+  effective_mode?: 'safe_serial' | 'pipelined' | 'parallel_pilot' | string
+  degraded?: boolean
+  degradation_reason?: string
+  active_platforms?: string[]
+  active_workers?: number
+  active_browser_targets?: number
+  browser_target_limit?: number
+  writer_queue_depth?: number
+  scorer_queue_depth?: number
 }
 
 interface WorkbenchData {
@@ -210,6 +227,34 @@ export function useDashboard(scope: DashboardDataScope = 'all') {
     return task
   }
 
+  const pauseTask = async (taskId: string) => {
+    const res = await fetch(`/api/workbench/task/${taskId}/pause`, { method: 'POST' })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error || '暂停失败')
+    }
+    const task = await res.json() as WorkbenchTask
+    setWorkbench(prev => ({ ...prev, task, last_task: task }))
+    void fetchAll()
+    return task
+  }
+
+  const resumeTask = async (taskId: string, options?: Record<string, unknown>) => {
+    const res = await fetch(`/api/workbench/task/${taskId}/resume`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(options ? { options } : {}),
+    })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error || '继续执行失败')
+    }
+    const task = await res.json() as WorkbenchTask
+    setWorkbench(prev => ({ ...prev, task, last_task: task }))
+    void fetchAll()
+    return task
+  }
+
   useEffect(() => {
     fetchAll()
     const interval = setInterval(fetchAll, 5000)
@@ -226,6 +271,8 @@ export function useDashboard(scope: DashboardDataScope = 'all') {
     refresh: fetchAll,
     startTask,
     stopTask,
+    pauseTask,
+    resumeTask,
   }
 }
 

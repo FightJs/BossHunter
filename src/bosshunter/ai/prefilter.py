@@ -2,7 +2,12 @@
 
 import re
 
-from bosshunter.job_filters import matching_blocked_company, matching_deal_breaker
+from bosshunter.job_filters import (
+    matches_search_keyword,
+    matching_blocked_company,
+    matching_deal_breaker,
+    parse_monthly_salary_k,
+)
 
 
 _INTERNSHIP_KEYWORDS = ("实习", "intern", "internship", "管培")
@@ -36,13 +41,20 @@ def quick_score(job: dict, config: dict) -> tuple[int, str]:
     if jd_breaker:
         return 0, f"触发JD排除词: {jd_breaker}"
 
+    source_keyword = str(job.get("source_keyword") or "").strip()
+    if not matches_search_keyword(title, jd, source_keyword):
+        return 0, f"搜索关键词未命中: {source_keyword}"
+
     if not profile.get("allow_internship", False) and _contains_internship_signal(job):
         return 0, "实习/管培岗位"
 
+    salary_minimum = _parse_salary_minimum_k(job.get("salary") or "")
     salary_min = _as_number(profile.get("salary_min", 0))
-    salary_max = _parse_salary_max_k(job.get("salary") or "")
-    if salary_min > 0 and salary_max is not None and salary_max < salary_min:
-        return 0, f"薪资低于硬性要求: {_format_k(salary_max)}K < {_format_k(salary_min)}K"
+    salary_max = _as_number(profile.get("salary_max", 0))
+    if salary_minimum is not None and salary_min > 0 and salary_minimum < salary_min:
+        return 0, f"薪资低于硬性要求: {_format_k(salary_minimum)}K < {_format_k(salary_min)}K"
+    if salary_minimum is not None and salary_max > 0 and salary_minimum > salary_max:
+        return 0, f"薪资高于期望上限: {_format_k(salary_minimum)}K > {_format_k(salary_max)}K"
 
     return 100, "预筛通过"
 
@@ -52,16 +64,9 @@ def _contains_internship_signal(job: dict) -> bool:
     return any(keyword.lower() in title for keyword in _INTERNSHIP_KEYWORDS)
 
 
-def _parse_salary_max_k(salary: str) -> float | None:
-    range_match = re.search(r"(\d+(?:\.\d+)?)\s*[kK]?\s*-\s*(\d+(?:\.\d+)?)\s*[kK]", salary)
-    if range_match:
-        return max(float(range_match.group(1)), float(range_match.group(2)))
-
-    single_match = re.search(r"(\d+(?:\.\d+)?)\s*[kK]", salary)
-    if single_match:
-        return float(single_match.group(1))
-
-    return None
+def _parse_salary_minimum_k(salary: str) -> float | None:
+    salary_range = parse_monthly_salary_k(salary)
+    return salary_range[0] if salary_range is not None else None
 
 
 def _as_number(value: object) -> float:

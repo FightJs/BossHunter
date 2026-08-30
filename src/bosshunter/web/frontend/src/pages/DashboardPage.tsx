@@ -24,6 +24,7 @@ import {
   ExternalLink,
   Eye,
   MessageCircle,
+  Pause,
   Play,
   RefreshCw,
   Send,
@@ -64,6 +65,8 @@ function taskStatusText(status: string) {
   if (status === 'completed') return '已结束'
   if (status === 'stopped') return '已停止'
   if (status === 'stopping') return '停止中'
+  if (status === 'pausing') return '暂停中'
+  if (status === 'paused') return '已暂停，可继续'
   return '运行中'
 }
 
@@ -297,6 +300,8 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
     refresh,
     startTask,
     stopTask,
+    pauseTask,
+    resumeTask,
   } = useDashboard(view)
   const [selected, setSelected] = useState<string[]>([])
   const [notice, setNotice] = useState('')
@@ -309,6 +314,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
   const [statsScope, setStatsScope] = useState<StatsScope>('today')
   const [collectDialogOpen, setCollectDialogOpen] = useState(false)
   const [collectDialogMode, setCollectDialogMode] = useState<'collect' | 'full'>('collect')
+  const [resumingTaskId, setResumingTaskId] = useState<string | null>(null)
 
   const todayJobs = useMemo(
     () => workbench.pending_confirmation.filter(job => !confirmedDeliveryIds.has(job.id)),
@@ -342,6 +348,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
   const pendingGreetingJobs = workbench.pending_greetings
   const activeTask = workbench.task
   const visibleTask = activeTask || workbench.last_task
+  const pausedTask = !activeTask && visibleTask?.status === 'paused' ? visibleTask : null
   const visibleTaskError = visibleTask?.error ? taskErrorFeedback(visibleTask.error) : null
   const pendingReplies = history.filter(item => item.action === 'reply_pending')
 
@@ -369,6 +376,10 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
 
   const handleModeClick = async (mode: WorkbenchMode) => {
     try {
+      if (pausedTask) {
+        setNotice('当前有已暂停任务，请先点击“继续执行”或“停止”后再启动其他模式。')
+        return
+      }
       if (activeTask?.mode === mode) {
         if (window.confirm(`是否停止当前${activeTask.label}任务？已入库岗位会保留。`)) {
           setModePending(mode)
@@ -426,9 +437,14 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
     setNotice(mode === 'full' ? '全流程启动前预检中...' : '岗位采集启动前预检中...')
     try {
       if (!(await runPreflight(mode, options))) return
-      await startTask(mode, options)
+      if (resumingTaskId) {
+        await resumeTask(resumingTaskId, options)
+        setResumingTaskId(null)
+      } else {
+        await startTask(mode, options)
+      }
       setCollectDialogOpen(false)
-      setNotice(mode === 'full' ? '全流程已启动，进度会在下方更新。' : '岗位采集已启动，进度会在下方更新。')
+      setNotice(resumingTaskId ? '已按新的设置从断点继续执行。' : mode === 'full' ? '全流程已启动，进度会在下方更新。' : '岗位采集已启动，进度会在下方更新。')
     } catch (err) {
       setNotice(err instanceof Error ? err.message : '岗位采集启动失败')
     } finally {
@@ -589,7 +605,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
         <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
           {modes.map(item => {
             const isActive = activeTask?.mode === item.mode
-            const disabled = Boolean(activeTask && !isActive)
+            const disabled = Boolean((activeTask && !isActive) || pausedTask)
             return (
               <button
                 key={item.mode}
@@ -647,9 +663,45 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
               </span>
             </div>
             <div className={`mt-3 rounded-2xl border px-4 py-3 ${taskStatusClass(visibleTask.status)}`}>
-              <div className="text-xs font-black text-primary">{taskStatusTitle(visibleTask.status)}</div>
-              <div className="mt-1 text-lg font-black text-foreground">{currentTaskStage(visibleTask.logs)}</div>
-              <div className="mt-1 text-xs font-bold text-muted">任务状态：{taskStatusText(visibleTask.status)}</div>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="text-xs font-black text-primary">{taskStatusTitle(visibleTask.status)}</div>
+                  <div className="mt-1 text-lg font-black text-foreground">{currentTaskStage(visibleTask.logs)}</div>
+                  <div className="mt-1 text-xs font-bold text-muted">任务状态：{taskStatusText(visibleTask.status)}</div>
+                  {visibleTask.checkpoint?.stage && (
+                    <div className="mt-1 text-xs text-muted">断点：{String(visibleTask.checkpoint.stage)}</div>
+                  )}
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {activeTask && activeTask.status === 'running' && (
+                    <Button size="sm" variant="secondary" onClick={() => {
+                      void pauseTask(activeTask.id).then(() => setNotice('已请求暂停，正在保存当前断点...')).catch(err => setNotice(err instanceof Error ? err.message : '暂停失败'))
+                    }}>
+                      <Pause className="mr-2 h-4 w-4" />暂停
+                    </Button>
+                  )}
+                  {pausedTask && (
+                    <Button size="sm" onClick={() => {
+                      if (visibleTask.mode === 'collect' || visibleTask.mode === 'full') {
+                        setResumingTaskId(visibleTask.id)
+                        setCollectDialogMode(visibleTask.mode)
+                        setCollectDialogOpen(true)
+                        return
+                      }
+                      void resumeTask(visibleTask.id).then(() => setNotice('已从断点继续执行。')).catch(err => setNotice(err instanceof Error ? err.message : '继续执行失败'))
+                    }}>
+                      <Play className="mr-2 h-4 w-4" />继续执行
+                    </Button>
+                  )}
+                  {activeTask && (activeTask.status === 'running' || activeTask.status === 'paused' || activeTask.status === 'pausing') && (
+                    <Button size="sm" variant="secondary" onClick={() => {
+                      void stopTask(activeTask.id).then(() => setNotice('已请求停止任务。')).catch(err => setNotice(err instanceof Error ? err.message : '停止失败'))
+                    }}>
+                      <Square className="mr-2 h-4 w-4" />停止
+                    </Button>
+                  )}
+                </div>
+              </div>
               {visibleTask.deadline_at && (
                 <div className="mt-1 text-xs font-bold text-muted">
                   自动截止：{new Date(visibleTask.deadline_at).toLocaleString('zh-CN', { hour12: false })}
@@ -906,7 +958,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
         open={collectDialogOpen}
         mode={collectDialogMode}
         activeTask={activeTask && (activeTask.mode === 'collect' || activeTask.mode === 'full') ? activeTask : null}
-        onClose={() => setCollectDialogOpen(false)}
+        onClose={() => { setCollectDialogOpen(false); setResumingTaskId(null) }}
         onStart={options => void startCollection(options)}
       />
     </div>
@@ -1021,6 +1073,9 @@ function JobsPoolView() {
   const [recycleLoading, setRecycleLoading] = useState(false)
   const [permanentDeleteIds, setPermanentDeleteIds] = useState<string[]>([])
   const [permanentDeleteAcknowledged, setPermanentDeleteAcknowledged] = useState(false)
+  const [clearPoolLoading, setClearPoolLoading] = useState(false)
+  const [selectAllLoading, setSelectAllLoading] = useState(false)
+  const [clearSelectedLoading, setClearSelectedLoading] = useState(false)
   const { items, total, allTotal, loading, error, refresh: refreshJobs } = useJobSearch(filters, page, pageSize, sortBy, sortOrder)
   const { workbench: deliveryWorkbench } = useDashboard('workbench')
   const deliveryTask = deliveryWorkbench.task?.mode === 'deliver'
@@ -1099,16 +1154,109 @@ function JobsPoolView() {
     return res.json()
   }
 
+  const loadFilteredJobIds = async () => {
+    const activeFilters = { ...filters }
+    const collectedIds: string[] = []
+    let offset = 0
+    const limit = 100
+    while (true) {
+      const params = new URLSearchParams({ limit: String(limit), offset: String(offset) })
+      if (activeFilters.query.trim()) params.set('q', activeFilters.query.trim())
+      if (activeFilters.minScore) params.set('min_score', activeFilters.minScore)
+      if (activeFilters.salaryMin) params.set('salary_min', activeFilters.salaryMin)
+      if (activeFilters.salaryMax) params.set('salary_max', activeFilters.salaryMax)
+      if (activeFilters.status) params.set('status', activeFilters.status)
+      if (activeFilters.createdWithin) params.set('created_within', activeFilters.createdWithin)
+      if (activeFilters.sourcePlatform) params.set('source_platform', activeFilters.sourcePlatform)
+      if (activeFilters.education) params.set('education', activeFilters.education)
+      if (activeFilters.recruitmentType) params.set('recruitment_type', activeFilters.recruitmentType)
+      const res = await fetch(`/api/jobs/search?${params.toString()}`, { cache: 'no-store' })
+      const data = await res.json().catch(() => ({})) as { items?: Job[]; total?: number; error?: string }
+      if (!res.ok) throw new Error(data.error || '读取筛选岗位失败')
+      const pageItems = Array.isArray(data.items) ? data.items : []
+      collectedIds.push(...pageItems.map(job => job.id))
+      if (!pageItems.length || pageItems.length < limit || collectedIds.length >= Number(data.total || 0)) break
+      offset += pageItems.length
+    }
+    return [...new Set(collectedIds)]
+  }
+
+  const selectAllFilteredJobs = async () => {
+    if (!total || selectAllLoading) return
+    setSelectAllLoading(true)
+    try {
+      const jobIds = await loadFilteredJobIds()
+      setSelectedIds(previous => [...new Set([...previous, ...jobIds])])
+      setNotice(`已选中当前筛选结果中的 ${jobIds.length} 条岗位。`)
+    } catch (cause) {
+      setNotice(cause instanceof Error ? cause.message : '全选岗位失败')
+    } finally {
+      setSelectAllLoading(false)
+    }
+  }
+
   const softDelete = async (jobIds: string[]) => {
     if (!jobIds.length || !window.confirm(`确认将 ${jobIds.length} 个岗位移入回收站吗？岗位不会永久删除。`)) return
+    setClearSelectedLoading(true)
+    const completedIds: string[] = []
+    let affectedCount = 0
     try {
-      const result = await postJobAction('/api/jobs/soft-delete', { job_ids: jobIds, confirmed: true })
-      setSelectedIds(previous => previous.filter(id => !jobIds.includes(id)))
+      for (let start = 0; start < jobIds.length; start += 500) {
+        const chunk = jobIds.slice(start, start + 500)
+        const result = await postJobAction('/api/jobs/soft-delete', { job_ids: chunk, confirmed: true })
+        completedIds.push(...chunk)
+        affectedCount += Number(result.affected_count || 0)
+      }
+      setSelectedIds(previous => previous.filter(id => !completedIds.includes(id)))
       refreshJobs()
       await loadRecycleBin()
-      setNotice(`已移入回收站 ${result.affected_count || 0} 条岗位。`)
+      setNotice(`已从岗位池清空 ${affectedCount} 条岗位，已移入回收站。`)
     } catch (cause) {
-      setNotice(cause instanceof Error ? cause.message : '移入回收站失败')
+      if (completedIds.length) {
+        setSelectedIds(previous => previous.filter(id => !completedIds.includes(id)))
+        refreshJobs()
+        await loadRecycleBin()
+      }
+      const detail = cause instanceof Error ? cause.message : '清空所选岗位失败'
+      setNotice(completedIds.length ? `已清空 ${affectedCount} 条岗位，剩余操作失败：${detail}` : detail)
+    } finally {
+      setClearSelectedLoading(false)
+    }
+  }
+
+  const clearJobPool = async () => {
+    if (!total || clearPoolLoading) return
+    if (!window.confirm(`确认清空当前筛选列表中的 ${total} 条岗位吗？未投递且没有回复证据的岗位将被永久删除，以便重新采集；该操作无法恢复，已有投递或回复证据的岗位会保留。`)) return
+    setClearPoolLoading(true)
+    try {
+      const result = await postJobAction('/api/jobs/clear', {
+        confirmed: true,
+        confirmation: 'CLEAR_JOB_POOL',
+        filters: {
+          q: filters.query.trim(),
+          min_score: filters.minScore,
+          salary_min: filters.salaryMin,
+          salary_max: filters.salaryMax,
+          status: filters.status,
+          created_within: filters.createdWithin,
+          source_platform: filters.sourcePlatform,
+          education: filters.education,
+          recruitment_type: filters.recruitmentType,
+        },
+      })
+      setSelectedIds([])
+      refreshJobs()
+      await loadRecycleBin()
+      const protectedCount = Number(result.protected_count || 0)
+      setNotice(
+        protectedCount
+          ? `已清空 ${result.affected_count || 0} 条岗位，保留 ${protectedCount} 条有投递或回复记录的岗位。`
+          : `已清空岗位池，共删除 ${result.affected_count || 0} 条岗位，可重新采集。`
+      )
+    } catch (cause) {
+      setNotice(cause instanceof Error ? cause.message : '清空岗位池失败')
+    } finally {
+      setClearPoolLoading(false)
     }
   }
 
@@ -1298,6 +1446,9 @@ function JobsPoolView() {
           <p className="mt-1 text-sm text-muted">集中查看已采集岗位、AI 分数、状态和详情入口。</p>
         </div>
         <div className="flex items-center gap-2">
+          <Button variant="destructive" size="sm" onClick={() => void clearJobPool()} disabled={!total || clearPoolLoading}>
+            <XCircle className="mr-1 h-4 w-4" />{clearPoolLoading ? '清空中…' : '清空岗位池'}
+          </Button>
           <Button variant="secondary" size="sm" onClick={() => { setShowRecycleBin(true); void loadRecycleBin() }}><Trash2 className="mr-1 h-4 w-4" />回收站 ({recycleJobs.length})</Button>
           <BriefcaseBusiness className="h-6 w-6 text-primary" />
         </div>
@@ -1316,9 +1467,14 @@ function JobsPoolView() {
         <Button variant="secondary" size="sm" disabled={!items.length} onClick={toggleCurrentPage}>
           {allPageSelected ? '取消选择本页' : '选择本页'}
         </Button>
+        <Button variant="secondary" size="sm" disabled={!total || selectAllLoading} onClick={() => void selectAllFilteredJobs()}>
+          {selectAllLoading ? '全选中…' : '一键全选筛选结果'}
+        </Button>
         <span className="rounded-full bg-[#FFF0E5] px-3 py-2 font-bold text-primary">已选择 {selectedIds.length} 条</span>
         {selectedIds.length > 0 && <Button variant="ghost" size="sm" onClick={() => setSelectedIds([])}>清空选择</Button>}
-        <Button variant="destructive" size="sm" disabled={!selectedIds.length} onClick={() => void softDelete(selectedIds)}>移入回收站</Button>
+        <Button variant="destructive" size="sm" disabled={!selectedIds.length || clearSelectedLoading} onClick={() => void softDelete(selectedIds)}>
+          {clearSelectedLoading ? '清空中…' : '清空所选岗位'}
+        </Button>
         <Button size="sm" disabled={!selectedIds.length} onClick={() => void deliverSelectedJobs()}>
           <Send className="mr-1 h-4 w-4" />BOSS 一键投递已选
         </Button>

@@ -6,7 +6,9 @@ import pytest
 from bosshunter.ai.scorer import score_jobs
 from bosshunter.db import (
     JobDeletionConflictError,
+    JobDeletionConfirmationError,
     add_history,
+    clear_active_jobs,
     get_db,
     get_jobs_by_status,
     get_jobs_pending_confirmation,
@@ -162,5 +164,30 @@ def test_permanent_delete_is_atomic_and_protects_delivery_history(tmp_path):
         result = permanent_delete_jobs(db, ["safe"], confirmed=True, confirmation="PERMANENT_DELETE")
         assert result["affected_count"] == 1
         assert db.execute("SELECT 1 FROM jobs WHERE id = 'safe'").fetchone() is None
+    finally:
+        db.close()
+
+
+def test_clear_active_jobs_permanently_removes_collectable_jobs_and_keeps_protected_jobs(tmp_path):
+    db = get_db(tmp_path / "clear-pool.db")
+    try:
+        insert_job(db, _job("clear-safe"))
+        insert_job(db, _job("clear-protected"))
+        update_job_status(db, "clear-protected", "sent")
+        add_history(db, "clear-protected", "sent", "已发送")
+
+        with pytest.raises(JobDeletionConfirmationError):
+            clear_active_jobs(db, confirmed=True, confirmation="WRONG")
+
+        result = clear_active_jobs(db, confirmed=True, confirmation="CLEAR_JOB_POOL")
+        assert result["requested_count"] == 2
+        assert result["affected_count"] == 1
+        assert result["protected_count"] == 1
+        assert {item["job_id"] for item in result["blocked"]} == {"clear-protected"}
+        assert db.execute("SELECT 1 FROM jobs WHERE id = 'clear-safe'").fetchone() is None
+        assert db.execute("SELECT 1 FROM history WHERE job_id = 'clear-safe'").fetchone() is None
+        assert db.execute("SELECT 1 FROM jobs WHERE id = 'clear-protected'").fetchone() is not None
+
+        assert insert_job(db, _job("clear-safe")) is True
     finally:
         db.close()

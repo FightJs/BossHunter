@@ -32,6 +32,14 @@ search:
 collection:
   default_order: [boss]
   auto_score_default: false
+  # safe_serial（默认）| pipelined（采集期间分批评分）| parallel_pilot（仅智联+51job受控并行）
+  execution_mode: safe_serial
+  # 仅用于受控发布；普通配置请保持 false。
+  parallel_pilot_enabled: false
+  max_non_boss_workers: 2
+  max_browser_targets: 3
+  score_batch_size: 5
+  score_flush_ms: 1000
   # 以下页面额度只统计 BOSS 直聘；智联和 51job 不占用。
   daily_search_page_limit: 30     # BOSS 单日搜索页上限
   daily_detail_page_limit: 150    # BOSS 单日详情页尝试上限
