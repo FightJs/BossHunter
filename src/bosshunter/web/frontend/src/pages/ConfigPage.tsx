@@ -7,7 +7,7 @@ import { Slider } from '@/components/ui/slider'
 import { TagsInput } from '@/components/ui/tags-input'
 import { CityMultiSelect, type CityOption } from '@/components/config/CityMultiSelect'
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
-import { Save, RotateCcw, Upload, Trash2, ChevronDown, ChevronRight } from 'lucide-react'
+import { Save, RotateCcw, Upload, Trash2, ChevronDown, ChevronRight, Plus, Check } from 'lucide-react'
 import { useState, useEffect } from 'react'
 
 const AI_SERVICES = {
@@ -43,6 +43,26 @@ const AI_SERVICES = {
 
 type AiService = keyof typeof AI_SERVICES
 type PlatformId = 'boss' | 'zhilian' | '51job'
+type AiProfile = {
+  id: string
+  name: string
+  service: AiService
+  provider: string
+  model?: string
+  api_key?: string
+  api_key_masked?: string
+  base_url?: string
+  thinking?: string
+  thinking_budget?: number
+  timeout_seconds?: number
+  clear_credentials?: boolean
+}
+
+const createProfileId = () => (
+  typeof crypto !== 'undefined' && crypto.randomUUID
+    ? crypto.randomUUID()
+    : `profile-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+)
 
 export default function ConfigPage() {
   const { config, schema, loading, saving, dirty, error, message, updateConfig, saveConfig, resetConfig } = useConfig()
@@ -52,9 +72,16 @@ export default function ConfigPage() {
     search: true,
     ...(requestedSection ? { [requestedSection]: true } : {}),
   }))
+  const [expandedMonitorGroups, setExpandedMonitorGroups] = useState<Record<string, boolean>>({
+    boss: true,
+    zhilian: false,
+    job51: false,
+    sending: false,
+  })
   const [resumeInfo, setResumeInfo] = useState<any>(null)
   const [resumeUploadError, setResumeUploadError] = useState('')
   const [aiTest, setAiTest] = useState<{ testing: boolean; ok?: boolean; message?: string }>({ testing: false })
+  const [expandedAiProfiles, setExpandedAiProfiles] = useState<Record<string, boolean>>({})
   const [cityOptions, setCityOptions] = useState<CityOption[]>([])
   const [zhilianCityOptions, setZhilianCityOptions] = useState<CityOption[]>([])
   const [job51CityOptions, setJob51CityOptions] = useState<CityOption[]>([])
@@ -86,6 +113,10 @@ export default function ConfigPage() {
 
   const toggleSection = (key: string) => {
     setExpandedSections(prev => ({ ...prev, [key]: !prev[key] }))
+  }
+
+  const toggleMonitorGroup = (key: string) => {
+    setExpandedMonitorGroups(prev => ({ ...prev, [key]: !prev[key] }))
   }
 
   const handleResumeUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -134,27 +165,6 @@ export default function ConfigPage() {
     } catch {
       setAiTest({ testing: false, ok: false, message: '无法连接本地检测接口，请确认 BossHunter 后端正在运行。' })
     }
-  }
-
-  const handleAiServiceChange = (service: AiService) => {
-    const currentService = (config?.ai?.service || (config?.ai?.provider === 'openai_compatible' ? 'custom' : 'anthropic')) as AiService
-    if (service === currentService) return
-    if (
-      (config?.ai?.api_key || config?.ai?.api_key_masked || config?.ai?.auth_token_masked)
-      && !window.confirm('切换 AI 服务商会清除当前保存的 AI 凭证，是否继续？')
-    ) {
-      return
-    }
-    const preset = AI_SERVICES[service]
-    updateConfig('ai.service', service)
-    updateConfig('ai.provider', preset.provider)
-    updateConfig('ai.base_url', preset.baseUrl)
-    updateConfig('ai.model', preset.defaultModel)
-    updateConfig('ai.api_key', '')
-    updateConfig('ai.api_key_masked', '')
-    updateConfig('ai.auth_token_masked', '')
-    updateConfig('ai.clear_credentials', true)
-    setAiTest({ testing: false })
   }
 
   const handleCityRefresh = async () => {
@@ -223,6 +233,94 @@ export default function ConfigPage() {
     const requested = value.split(',').filter((item): item is PlatformId => item === 'boss' || item === 'zhilian' || item === '51job')
     const next = [...requested, ...enabled.filter(platform => !requested.includes(platform))]
     updateConfig('collection.default_order', next.length ? next : ['boss'])
+  }
+
+  const aiProfiles: AiProfile[] = Array.isArray(config?.ai?.profiles) && config.ai.profiles.length
+    ? config.ai.profiles
+    : [{
+      id: 'default',
+      name: '默认 API',
+      service: (config?.ai?.service || (config?.ai?.provider === 'openai_compatible' ? 'custom' : 'anthropic')) as AiService,
+      provider: config?.ai?.provider || 'anthropic',
+      model: config?.ai?.model || '',
+      api_key: config?.ai?.api_key || '',
+      api_key_masked: config?.ai?.api_key_masked || '',
+      base_url: config?.ai?.base_url || '',
+      thinking: config?.ai?.thinking || 'auto',
+      thinking_budget: config?.ai?.thinking_budget || 2048,
+      timeout_seconds: config?.ai?.timeout_seconds || 180,
+    }]
+  const activeAiProfileId = aiProfiles.some(profile => profile.id === config?.ai?.active_profile_id)
+    ? config?.ai?.active_profile_id
+    : aiProfiles[0].id
+
+  const updateAiProfile = (profileId: string, values: Partial<AiProfile>) => {
+    const nextProfiles = aiProfiles.map(profile => profile.id === profileId ? { ...profile, ...values } : profile)
+    updateConfig('ai.profiles', nextProfiles)
+    if (profileId === activeAiProfileId) {
+      Object.entries(values).forEach(([field, value]) => {
+        if (['service', 'provider', 'model', 'api_key', 'base_url', 'thinking', 'thinking_budget', 'timeout_seconds'].includes(field)) {
+          updateConfig(`ai.${field}`, value)
+        }
+      })
+    }
+    setAiTest({ testing: false })
+  }
+
+  const selectAiProfile = (profile: AiProfile) => {
+    updateConfig('ai.active_profile_id', profile.id)
+    Object.entries(profile).forEach(([field, value]) => {
+      if (['service', 'provider', 'model', 'api_key', 'base_url', 'thinking', 'thinking_budget', 'timeout_seconds'].includes(field)) {
+        updateConfig(`ai.${field}`, value)
+      }
+    })
+    setAiTest({ testing: false })
+  }
+
+  const addAiProfile = () => {
+    const profile: AiProfile = {
+      id: createProfileId(),
+      name: `API 配置 ${aiProfiles.length + 1}`,
+      service: 'custom',
+      provider: AI_SERVICES.custom.provider,
+      model: '',
+      api_key: '',
+      base_url: '',
+      thinking: 'auto',
+      thinking_budget: 2048,
+      timeout_seconds: 180,
+    }
+    updateConfig('ai.profiles', [...aiProfiles, profile])
+    setExpandedAiProfiles(current => ({ ...current, [profile.id]: true }))
+    setAiTest({ testing: false })
+  }
+
+  const removeAiProfile = (profileId: string) => {
+    if (aiProfiles.length === 1) return
+    const profile = aiProfiles.find(item => item.id === profileId)
+    if (!window.confirm(`删除“${profile?.name || '此 API 配置'}”后无法恢复，是否继续？`)) return
+    const nextProfiles = aiProfiles.filter(item => item.id !== profileId)
+    updateConfig('ai.profiles', nextProfiles)
+    if (profileId === activeAiProfileId) selectAiProfile(nextProfiles[0])
+    setAiTest({ testing: false })
+  }
+
+  const handleAiServiceChange = (profile: AiProfile, service: AiService) => {
+    if (service === profile.service) return
+    if (
+      (profile.api_key || profile.api_key_masked)
+      && !window.confirm('切换服务商会清除这条 API 配置中已保存的凭证，是否继续？')
+    ) return
+    const preset = AI_SERVICES[service]
+    updateAiProfile(profile.id, {
+      service,
+      provider: preset.provider,
+      base_url: preset.baseUrl,
+      model: preset.defaultModel,
+      api_key: '',
+      api_key_masked: '',
+      clear_credentials: true,
+    })
   }
 
   if (loading) {
@@ -424,7 +522,7 @@ export default function ConfigPage() {
                 </div>
               )
             })}
-            <div className="grid gap-3 md:grid-cols-2">
+            <div className="grid gap-3 lg:grid-cols-3">
               <Field label="默认执行顺序">
                 <Select value={Array.isArray(config.collection?.default_order) ? config.collection.default_order.join(',') : 'boss'} onChange={event => setCollectionOrder(event.target.value)}>
                   <option value="boss">BOSS 直聘</option>
@@ -440,6 +538,24 @@ export default function ConfigPage() {
                 <Switch checked={config.collection?.auto_score_default ?? false} onChange={value => updateConfig('collection.auto_score_default', value)} />
               </div>
             </div>
+            <div className="grid gap-3 md:grid-cols-2">
+              <div className="flex items-center justify-between rounded-xl border border-card-border bg-[#FFFCFA] px-3 py-2 text-xs font-bold text-muted">
+                <span>启用受控并行采集 <span className="font-normal">（智联 + 51job）</span></span>
+                <Switch checked={config.collection?.parallel_pilot_enabled ?? false} onChange={value => updateConfig('collection.parallel_pilot_enabled', value)} />
+              </div>
+              <div className="flex items-center justify-between rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs font-bold text-amber-800">
+                <span>高风险并行 <span className="font-normal">（BOSS + 智联）</span></span>
+                <Switch checked={config.collection?.parallel_boss_zhilian_enabled ?? false} onChange={value => updateConfig('collection.parallel_boss_zhilian_enabled', value)} />
+              </div>
+              <div className="flex items-center justify-between rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs font-bold text-red-800">
+                <span>试点并行 <span className="font-normal">（BOSS + 智联 + 51job）</span></span>
+                <Switch checked={config.collection?.parallel_all_platforms_enabled ?? false} onChange={value => updateConfig('collection.parallel_all_platforms_enabled', value)} />
+              </div>
+              <Field label="并行采集工作者数">
+                <Input type="number" value={config.collection?.max_non_boss_workers ?? 2} onChange={e => updateConfig('collection.max_non_boss_workers', Number(e.target.value))} min={1} max={2} />
+              </Field>
+            </div>
+            <p className="text-xs leading-5 text-muted">开启后，在岗位采集窗口选择对应并行模式即可同时打开独立标签页。三平台并行最多使用 3 个标签页；任一平台触发验证码、限流或浏览器异常，本轮会停止并保留已采集结果。</p>
           </div>
         </SectionCard>
 
@@ -458,72 +574,95 @@ export default function ConfigPage() {
         {/* AI Section */}
         <SectionCard title="AI 设置" sectionKey="ai" expanded={expandedSections} toggle={toggleSection}>
           <div className="space-y-4">
-            <Field label="提供商">
-              <Select
-                value={config.ai?.service || (config.ai?.provider === 'openai_compatible' ? 'custom' : 'anthropic')}
-                onChange={e => handleAiServiceChange(e.target.value as AiService)}
-              >
-                {Object.entries(AI_SERVICES).map(([value, preset]) => (
-                  <option key={value} value={value}>{preset.label}</option>
-                ))}
-              </Select>
-              <p className="mt-1 text-xs text-muted">
-                BossHunter 会自动配置协议和服务地址；也可安全复用环境变量 {
-                  AI_SERVICES[(config.ai?.service || (config.ai?.provider === 'openai_compatible' ? 'custom' : 'anthropic')) as AiService].keyEnv
-                }，不会在前端显示其内容。
-              </p>
-            </Field>
-            <Field label="模型名称">
-              <Input value={config.ai?.model || ''} onChange={e => {
-                updateConfig('ai.model', e.target.value)
-                setAiTest({ testing: false })
-              }} placeholder="填写服务商当前支持的模型 ID" />
-            </Field>
-            <Field label="API Key">
-              <Input type="password" value={config.ai?.api_key || ''} onChange={e => {
-                updateConfig('ai.api_key', e.target.value)
-                setAiTest({ testing: false })
-              }} placeholder={config.ai?.api_key_masked || '也可通过环境变量设置'} />
-            </Field>
-            <Field label="Base URL">
-              <Input value={config.ai?.base_url || ''} onChange={e => {
-                updateConfig('ai.base_url', e.target.value)
-                setAiTest({ testing: false })
-              }} placeholder="留空使用默认" />
-            </Field>
-            <div className="grid gap-4 md:grid-cols-2">
-              <Field label="Thinking 模式">
-                <Select
-                  value={config.ai?.thinking || 'auto'}
-                  onChange={e => updateConfig('ai.thinking', e.target.value)}
-                >
-                  <option value="auto">自动兼容（推荐）</option>
-                  <option value="disabled">强制关闭</option>
-                  <option value="enabled">强制开启</option>
-                  <option value="off">不发送参数</option>
-                </Select>
-                <p className="mt-1 text-xs text-muted">自动模式优先获取纯文本；接口不支持 thinking 参数时会安全回退。</p>
-              </Field>
-              <Field label="Thinking 预算 Token">
-                <Input
-                  type="number"
-                  value={config.ai?.thinking_budget || 2048}
-                  onChange={e => updateConfig('ai.thinking_budget', Number(e.target.value))}
-                  min={1024}
-                  max={32768}
-                  disabled={(config.ai?.thinking || 'auto') !== 'enabled'}
-                />
-              </Field>
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-xs leading-5 text-muted">选择一条配置作为当前使用的 API。每条配置的凭证单独保存，不会相互覆盖。</p>
+              <Button type="button" variant="secondary" size="sm" onClick={addAiProfile}>
+                <Plus className="mr-1 h-3.5 w-3.5" />添加 API
+              </Button>
             </div>
-            <Field label="AI 请求超时 (秒)">
-              <Input
-                type="number"
-                value={config.ai?.timeout_seconds || 180}
-                onChange={e => updateConfig('ai.timeout_seconds', Number(e.target.value))}
-                min={5}
-                max={600}
-              />
-            </Field>
+
+            <div className="space-y-2">
+              {aiProfiles.map(profile => {
+                const isActive = profile.id === activeAiProfileId
+                const isExpanded = expandedAiProfiles[profile.id] ?? isActive
+                const service = AI_SERVICES[profile.service] || AI_SERVICES.custom
+                return (
+                  <div key={profile.id} className="overflow-hidden rounded-lg border border-card-border bg-white">
+                    <div className="flex min-h-12 items-center gap-2 px-3">
+                      <button
+                        type="button"
+                        className="flex min-w-0 flex-1 items-center gap-3 py-2 text-left"
+                        onClick={() => setExpandedAiProfiles(current => ({ ...current, [profile.id]: !isExpanded }))}
+                        aria-expanded={isExpanded}
+                      >
+                        <span className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full ${isActive ? 'bg-primary text-white' : 'border border-card-border text-muted'}`}>
+                          {isActive && <Check className="h-3 w-3" />}
+                        </span>
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-sm font-semibold text-foreground">{profile.name || '未命名 API'}</span>
+                          <span className="block truncate text-xs text-muted">{service.label}{profile.model ? ` · ${profile.model}` : ''}</span>
+                        </span>
+                        {isExpanded ? <ChevronDown className="h-4 w-4 shrink-0 text-muted" /> : <ChevronRight className="h-4 w-4 shrink-0 text-muted" />}
+                      </button>
+                      <div className="flex shrink-0 items-center gap-1">
+                        {!isActive && (
+                          <Button type="button" variant="ghost" size="sm" onClick={() => selectAiProfile(profile)}>使用</Button>
+                        )}
+                        {aiProfiles.length > 1 && (
+                          <Button type="button" variant="ghost" size="icon" aria-label={`删除 ${profile.name || 'API 配置'}`} title="删除此 API 配置" onClick={() => removeAiProfile(profile.id)}>
+                            <Trash2 className="h-3.5 w-3.5 text-danger" />
+                          </Button>
+                        )}
+                      </div>
+                    </div>
+
+                    {isExpanded && (
+                      <div className="border-t border-card-border bg-[#FFFCFA] p-3">
+                        <div className="space-y-4">
+                          <Field label="备注名称">
+                            <Input value={profile.name} onChange={e => updateAiProfile(profile.id, { name: e.target.value })} placeholder="例如：工作账号、备用模型" />
+                          </Field>
+                          <Field label="提供商">
+                            <Select value={profile.service} onChange={e => handleAiServiceChange(profile, e.target.value as AiService)}>
+                              {Object.entries(AI_SERVICES).map(([value, preset]) => <option key={value} value={value}>{preset.label}</option>)}
+                            </Select>
+                            <p className="mt-1 text-xs text-muted">可使用环境变量 {service.keyEnv}；其内容不会在页面显示。</p>
+                          </Field>
+                          <Field label="模型名称">
+                            <Input value={profile.model || ''} onChange={e => updateAiProfile(profile.id, { model: e.target.value })} placeholder="填写服务商当前支持的模型 ID" />
+                          </Field>
+                          <Field label="API Key">
+                            <Input type="password" value={profile.api_key || ''} onChange={e => updateAiProfile(profile.id, { api_key: e.target.value, clear_credentials: false })} placeholder={profile.api_key_masked || '也可通过环境变量设置'} />
+                          </Field>
+                          <Field label="Base URL">
+                            <Input value={profile.base_url || ''} onChange={e => updateAiProfile(profile.id, { base_url: e.target.value })} placeholder="留空使用默认" />
+                          </Field>
+                          <div className="grid gap-4 md:grid-cols-2">
+                            <Field label="Thinking 模式">
+                              <Select value={profile.thinking || 'auto'} onChange={e => updateAiProfile(profile.id, { thinking: e.target.value })}>
+                                <option value="auto">自动兼容（推荐）</option>
+                                <option value="disabled">强制关闭</option>
+                                <option value="enabled">强制开启</option>
+                                <option value="off">不发送参数</option>
+                              </Select>
+                              <p className="mt-1 text-xs text-muted">接口不支持 thinking 参数时会安全回退。</p>
+                            </Field>
+                            <Field label="Thinking 预算 Token">
+                              <Input type="number" value={profile.thinking_budget || 2048} onChange={e => updateAiProfile(profile.id, { thinking_budget: Number(e.target.value) })} min={1024} max={32768} disabled={(profile.thinking || 'auto') !== 'enabled'} />
+                            </Field>
+                          </div>
+                          <Field label="AI 请求超时 (秒)">
+                            <Input type="number" value={profile.timeout_seconds || 180} onChange={e => updateAiProfile(profile.id, { timeout_seconds: Number(e.target.value) })} min={5} max={600} />
+                          </Field>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+
+            <div className="border-t border-card-border pt-4">
             <Field label="AI 评分并发数">
               <Select
                 value={String(config.ai?.scoring_concurrency || 2)}
@@ -533,6 +672,15 @@ export default function ConfigPage() {
               </Select>
               <p className="mt-1 text-xs text-muted">默认 2；可降至 1 以降低 API 限流风险，或提升至 3 以加快评分。</p>
             </Field>
+            <Field label="招呼语生成并发数">
+              <Select
+                value={String(config.ai?.greeting_concurrency || 2)}
+                onChange={e => updateConfig('ai.greeting_concurrency', Number(e.target.value))}
+              >
+                {[1, 2, 3].map(value => <option key={value} value={value}>{value}</option>)}
+              </Select>
+              <p className="mt-1 text-xs text-muted">默认 2；每个岗位独立生成，数据库写入仍串行；提高后可能增加 API 限流风险。</p>
+            </Field>
             <div className="flex items-center justify-between rounded-lg border border-card-border bg-[#FFFCFA] p-3">
               <div>
                 <label className="text-xs font-bold text-foreground">临界评分二次复核</label>
@@ -540,11 +688,12 @@ export default function ConfigPage() {
               </div>
               <Switch checked={config.ai?.scoring_second_review ?? false} onChange={v => updateConfig('ai.scoring_second_review', v)} />
             </div>
-            <div className="rounded-2xl border border-card-border bg-[#FFFCFA] p-3">
+            </div>
+            <div className="rounded-lg border border-card-border bg-[#FFFCFA] p-3">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                   <div className="text-sm font-black text-foreground">AI 连接检测</div>
-                  <p className="mt-1 text-xs text-muted">不会消耗对话 Token；检测已保存的 Key、Base URL 和服务可用性。</p>
+                  <p className="mt-1 text-xs text-muted">检测当前使用的 API，不会消耗对话 Token。</p>
                 </div>
                 <Button variant="secondary" size="sm" onClick={handleAiTest} disabled={aiTest.testing}>
                   {aiTest.testing ? '检测中...' : '测试连接'}
@@ -564,88 +713,147 @@ export default function ConfigPage() {
         {/* Anti-monitoring Section */}
         <SectionCard title="反监测设置" sectionKey="collection" expanded={expandedSections} toggle={toggleSection}>
           <div className="space-y-4">
-            <div className="grid gap-4 md:grid-cols-2">
-              <Field label="BOSS 单日搜索页上限">
-                <Input type="number" value={config.collection?.daily_search_page_limit ?? 30} onChange={e => updateConfig('collection.daily_search_page_limit', Number(e.target.value))} min={1} max={200} />
-                {bossTheoreticalPages > 0 && (
-                  <p className={`mt-1 text-xs ${bossTheoreticalExceedsLimit ? 'font-bold text-amber-700' : 'text-muted'}`}>
-                    当前搜索组合理论最多 {bossTheoreticalPages} 页；{bossTheoreticalExceedsLimit ? `超过本上限 ${bossDailySearchLimit} 页，会在设置处和执行时提示。` : '未超过本上限。'}
-                  </p>
-                )}
-              </Field>
-              <Field label="BOSS 单日详情页尝试上限">
-                <Input type="number" value={config.collection?.daily_detail_page_limit ?? 150} onChange={e => updateConfig('collection.daily_detail_page_limit', Number(e.target.value))} min={1} max={500} />
-              </Field>
-              <Field label="BOSS 连续页面失败停止阈值">
-                <Input type="number" value={config.collection?.max_consecutive_page_failures ?? 3} onChange={e => updateConfig('collection.max_consecutive_page_failures', Number(e.target.value))} min={1} max={10} />
-              </Field>
-              <NumberRangeField
-                label="BOSS 风险暂停范围（分钟）"
-                minValue={config.collection?.risk_pause_min_minutes ?? 5}
-                maxValue={config.collection?.risk_pause_max_minutes ?? 10}
-                onMinChange={value => updateConfig('collection.risk_pause_min_minutes', value)}
-                onMaxChange={value => updateConfig('collection.risk_pause_max_minutes', value)}
-                min={1}
-                max={60}
-              />
-              <Field label="BOSS 操作间隔倍率">
-                <Input type="number" value={config.collection?.collection_delay_multiplier ?? 1.5} onChange={e => updateConfig('collection.collection_delay_multiplier', Number(e.target.value))} min={1} max={5} step={0.1} />
-                <p className="mt-1 text-xs text-muted">同时作用于 BOSS 采集和监测的页面操作与每轮等待；数值越大，间隔越长。</p>
-              </Field>
-              <NumberRangeField
-                label="BOSS 采集后投递冷却范围（分钟）"
-                minValue={config.collection?.delivery_cooldown_min_minutes ?? 5}
-                maxValue={config.collection?.delivery_cooldown_max_minutes ?? 15}
-                onMinChange={value => updateConfig('collection.delivery_cooldown_min_minutes', value)}
-                onMaxChange={value => updateConfig('collection.delivery_cooldown_max_minutes', value)}
-                min={0}
-                max={240}
-              />
-            </div>
-            <p className="text-xs text-muted">完成 BOSS 采集后，每次会在设定区间内随机等待一次再投递；默认为 5–15 分钟，单独采集不受影响。</p>
-            <Field label="BOSS 单日页面访问总上限">
-              <Input type="number" value={config.safety?.daily_platform_page_limit ?? 500} onChange={e => updateConfig('safety.daily_platform_page_limit', Number(e.target.value))} min={1} max={2000} />
-              <p className="mt-1 text-xs text-muted">只合计 BOSS 采集、自动投递和监测打开的页面；智联和 51job 不占用。</p>
-            </Field>
-            <div className="grid gap-4 md:grid-cols-2">
-              <Field label="每日发送上限">
-                <Input type="number" value={config.throttle?.daily_limit || 30} onChange={e => updateConfig('throttle.daily_limit', Number(e.target.value))} />
-              </Field>
-              <NumberRangeField
-                label="发送间隔范围（秒）"
-                minValue={config.throttle?.interval_min ?? 60}
-                maxValue={config.throttle?.interval_max ?? 180}
-                onMinChange={value => updateConfig('throttle.interval_min', value)}
-                onMaxChange={value => updateConfig('throttle.interval_max', value)}
-                min={10}
-                max={600}
-              />
-            </div>
-            <div className="grid items-end gap-4 md:grid-cols-2">
-              <div className="flex h-9 items-center justify-between rounded-md border border-card-border bg-[#FFFCFA] px-3">
-                <label className="text-xs text-foreground">发送前模拟浏览</label>
-                <Switch checked={config.throttle?.browse_before_greet ?? true} onChange={v => updateConfig('throttle.browse_before_greet', v)} />
+            <CollapsibleGroup
+              title="BOSS 直聘"
+              open={!!expandedMonitorGroups.boss}
+              onToggle={() => toggleMonitorGroup('boss')}
+            >
+              <div className="space-y-4">
+                <div className="grid gap-4 md:grid-cols-2">
+                  <Field label="BOSS 单日搜索页上限">
+                    <Input type="number" value={config.collection?.daily_search_page_limit ?? 30} onChange={e => updateConfig('collection.daily_search_page_limit', Number(e.target.value))} min={1} max={200} />
+                    {bossTheoreticalPages > 0 && (
+                      <p className={`mt-1 text-xs ${bossTheoreticalExceedsLimit ? 'font-bold text-amber-700' : 'text-muted'}`}>
+                        当前搜索组合理论最多 {bossTheoreticalPages} 页；{bossTheoreticalExceedsLimit ? `超过本上限 ${bossDailySearchLimit} 页，会在设置处和执行时提示。` : '未超过本上限。'}
+                      </p>
+                    )}
+                  </Field>
+                  <Field label="BOSS 单日详情页尝试上限">
+                    <Input type="number" value={config.collection?.daily_detail_page_limit ?? 150} onChange={e => updateConfig('collection.daily_detail_page_limit', Number(e.target.value))} min={1} max={500} />
+                  </Field>
+                  <Field label="BOSS 连续页面失败停止阈值">
+                    <Input type="number" value={config.collection?.max_consecutive_page_failures ?? 3} onChange={e => updateConfig('collection.max_consecutive_page_failures', Number(e.target.value))} min={1} max={10} />
+                  </Field>
+                  <NumberRangeField
+                    label="BOSS 风险暂停范围（分钟）"
+                    minValue={config.collection?.risk_pause_min_minutes ?? 5}
+                    maxValue={config.collection?.risk_pause_max_minutes ?? 10}
+                    onMinChange={value => updateConfig('collection.risk_pause_min_minutes', value)}
+                    onMaxChange={value => updateConfig('collection.risk_pause_max_minutes', value)}
+                    min={1}
+                    max={60}
+                  />
+                  <Field label="BOSS 操作间隔倍率">
+                    <Input type="number" value={config.collection?.collection_delay_multiplier ?? 1.5} onChange={e => updateConfig('collection.collection_delay_multiplier', Number(e.target.value))} min={1} max={5} step={0.1} />
+                    <p className="mt-1 text-xs text-muted">同时作用于 BOSS 采集和监测的页面操作与每轮等待；数值越大，间隔越长。</p>
+                  </Field>
+                  <NumberRangeField
+                    label="BOSS 采集后投递冷却范围（分钟）"
+                    minValue={config.collection?.delivery_cooldown_min_minutes ?? 5}
+                    maxValue={config.collection?.delivery_cooldown_max_minutes ?? 15}
+                    onMinChange={value => updateConfig('collection.delivery_cooldown_min_minutes', value)}
+                    onMaxChange={value => updateConfig('collection.delivery_cooldown_max_minutes', value)}
+                    min={0}
+                    max={240}
+                  />
+                </div>
+                <p className="text-xs text-muted">完成 BOSS 采集后，每次会在设定区间内随机等待一次再投递；默认为 5–15 分钟，单独采集不受影响。</p>
+                <Field label="BOSS 单日页面访问总上限">
+                  <Input type="number" value={config.safety?.daily_platform_page_limit ?? 500} onChange={e => updateConfig('safety.daily_platform_page_limit', Number(e.target.value))} min={1} max={2000} />
+                  <p className="mt-1 text-xs text-muted">只合计 BOSS 采集、自动投递和监测打开的页面；智联和 51job 不占用。</p>
+                </Field>
               </div>
-              <NumberRangeField
-                label="模拟浏览时长范围（秒）"
-                minValue={config.throttle?.browse_duration_min ?? 15}
-                maxValue={config.throttle?.browse_duration_max ?? 30}
-                onMinChange={value => updateConfig('throttle.browse_duration_min', value)}
-                onMaxChange={value => updateConfig('throttle.browse_duration_max', value)}
-                min={5}
-                max={120}
-                disabled={!(config.throttle?.browse_before_greet ?? true)}
-              />
-            </div>
-            <div className="grid gap-4 md:grid-cols-2">
-              <Field label="发送时间窗口">
-                <TagsInput value={config.throttle?.send_windows || ['09:00-16:00']} onChange={v => updateConfig('throttle.send_windows', v)} placeholder="HH:MM-HH:MM" />
-                <p className="mt-1 text-xs text-muted">当天最后一个窗口结束时自动停止。</p>
-              </Field>
-              <Field label="随机休息概率">
-                <Input type="number" value={config.throttle?.day_off_probability || 0.05} onChange={e => updateConfig('throttle.day_off_probability', Number(e.target.value))} step={0.01} min={0} max={1} />
-              </Field>
-            </div>
+            </CollapsibleGroup>
+            <CollapsibleGroup
+              title="智联招聘"
+              open={!!expandedMonitorGroups.zhilian}
+              onToggle={() => toggleMonitorGroup('zhilian')}
+            >
+              <div className="grid gap-4 md:grid-cols-2">
+                <NumberRangeField
+                  label="智联招聘 详情间隔范围（秒）"
+                  minValue={config.collection?.zhilian_detail_delay_min_seconds ?? 8}
+                  maxValue={config.collection?.zhilian_detail_delay_max_seconds ?? 15}
+                  onMinChange={value => updateConfig('collection.zhilian_detail_delay_min_seconds', value)}
+                  onMaxChange={value => updateConfig('collection.zhilian_detail_delay_max_seconds', value)}
+                  min={1}
+                  max={120}
+                />
+              </div>
+            </CollapsibleGroup>
+            <CollapsibleGroup
+              title="51job"
+              open={!!expandedMonitorGroups.job51}
+              onToggle={() => toggleMonitorGroup('job51')}
+            >
+              <div className="grid gap-4 md:grid-cols-2">
+                <NumberRangeField
+                  label="51job 翻页间隔范围（秒）"
+                  minValue={config.collection?.job51_page_delay_min_seconds ?? 30}
+                  maxValue={config.collection?.job51_page_delay_max_seconds ?? 45}
+                  onMinChange={value => updateConfig('collection.job51_page_delay_min_seconds', value)}
+                  onMaxChange={value => updateConfig('collection.job51_page_delay_max_seconds', value)}
+                  min={10}
+                  max={600}
+                />
+                <NumberRangeField
+                  label="51job 详情间隔范围（秒）"
+                  minValue={config.collection?.job51_detail_delay_min_seconds ?? 12}
+                  maxValue={config.collection?.job51_detail_delay_max_seconds ?? 20}
+                  onMinChange={value => updateConfig('collection.job51_detail_delay_min_seconds', value)}
+                  onMaxChange={value => updateConfig('collection.job51_detail_delay_max_seconds', value)}
+                  min={1}
+                  max={300}
+                />
+              </div>
+            </CollapsibleGroup>
+            <CollapsibleGroup
+              title="发送节奏"
+              open={!!expandedMonitorGroups.sending}
+              onToggle={() => toggleMonitorGroup('sending')}
+            >
+              <div className="space-y-4">
+                <div className="grid gap-4 md:grid-cols-2">
+                  <Field label="每日发送上限">
+                    <Input type="number" value={config.throttle?.daily_limit || 30} onChange={e => updateConfig('throttle.daily_limit', Number(e.target.value))} />
+                  </Field>
+                  <NumberRangeField
+                    label="发送间隔范围（秒）"
+                    minValue={config.throttle?.interval_min ?? 60}
+                    maxValue={config.throttle?.interval_max ?? 180}
+                    onMinChange={value => updateConfig('throttle.interval_min', value)}
+                    onMaxChange={value => updateConfig('throttle.interval_max', value)}
+                    min={10}
+                    max={600}
+                  />
+                </div>
+                <div className="grid items-end gap-4 md:grid-cols-2">
+                  <div className="flex h-9 items-center justify-between rounded-md border border-card-border bg-[#FFFCFA] px-3">
+                    <label className="text-xs text-foreground">发送前模拟浏览</label>
+                    <Switch checked={config.throttle?.browse_before_greet ?? true} onChange={v => updateConfig('throttle.browse_before_greet', v)} />
+                  </div>
+                  <NumberRangeField
+                    label="模拟浏览时长范围（秒）"
+                    minValue={config.throttle?.browse_duration_min ?? 15}
+                    maxValue={config.throttle?.browse_duration_max ?? 30}
+                    onMinChange={value => updateConfig('throttle.browse_duration_min', value)}
+                    onMaxChange={value => updateConfig('throttle.browse_duration_max', value)}
+                    min={5}
+                    max={120}
+                    disabled={!(config.throttle?.browse_before_greet ?? true)}
+                  />
+                </div>
+                <div className="grid gap-4 md:grid-cols-2">
+                  <Field label="发送时间窗口">
+                    <TagsInput value={config.throttle?.send_windows || ['09:00-16:00']} onChange={v => updateConfig('throttle.send_windows', v)} placeholder="HH:MM-HH:MM" />
+                    <p className="mt-1 text-xs text-muted">主动投递任务会在当天最后一个窗口结束时自动停止；单独监测仍可处理 HR 回复和简历请求。</p>
+                  </Field>
+                  <Field label="随机休息概率">
+                    <Input type="number" value={config.throttle?.day_off_probability || 0.05} onChange={e => updateConfig('throttle.day_off_probability', Number(e.target.value))} step={0.01} min={0} max={1} />
+                  </Field>
+                </div>
+              </div>
+            </CollapsibleGroup>
           </div>
         </SectionCard>
 
@@ -726,6 +934,25 @@ function SectionCard({ title, sectionKey, expanded, toggle, children }: {
       </button>
       {isExpanded && <div className="px-4 pb-4">{children}</div>}
     </Card>
+  )
+}
+
+function CollapsibleGroup({ title, open, onToggle, children }: {
+  title: string; open: boolean; onToggle: () => void; children: React.ReactNode
+}) {
+  return (
+    <div className="border-t border-card-border pt-3">
+      <button
+        type="button"
+        className="flex w-full items-center justify-between py-1 text-left"
+        onClick={onToggle}
+        aria-expanded={open}
+      >
+        <span className="text-sm font-black text-foreground">{title}</span>
+        {open ? <ChevronDown className="h-4 w-4 text-muted" /> : <ChevronRight className="h-4 w-4 text-muted" />}
+      </button>
+      {open && <div className="mt-3">{children}</div>}
+    </div>
   )
 }
 

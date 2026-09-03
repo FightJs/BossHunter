@@ -13,7 +13,7 @@ export function Header() {
   const title = pageTitles[location.pathname] || 'BossHunter'
 
   return (
-    <header className="h-16 border-b border-card-border bg-[#FFFCFA] flex items-center justify-between px-6">
+    <header className="h-16 border-b border-card-border bg-[#FFFCFA] flex items-center justify-between px-6 max-md:px-3">
       <h1 className="text-lg font-black text-foreground">{title}</h1>
       <div className="flex items-center gap-2 text-xs text-muted">
         <Activity className="w-3 h-3 text-success" />

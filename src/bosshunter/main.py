@@ -266,7 +266,7 @@ def monitor(ctx: click.Context, once: bool, interval: int | None) -> None:
 
     if once:
         console.print("[bold cyan]═══ 单次监听模式 ═══[/bold cyan]\n")
-        summary = monitor_and_send_resumes(config)
+        summary = monitor_and_send_resumes(config, allow_outside_send_window=True)
         parts = [
             f"自动回复{summary.get('replied', 0)}条",
             f"跳过{summary.get('skipped', 0)}条",
@@ -286,7 +286,7 @@ def monitor(ctx: click.Context, once: bool, interval: int | None) -> None:
         try:
             while True:
                 try:
-                    summary = monitor_and_send_resumes(config)
+                    summary = monitor_and_send_resumes(config, allow_outside_send_window=True)
                     if summary.get("stop_reason"):
                         console.print("[red]检测到平台风险信号，持续监测已安全停止[/red]")
                         break

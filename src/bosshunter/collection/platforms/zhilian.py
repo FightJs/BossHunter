@@ -58,6 +58,14 @@ ZHILIAN_SEARCH_INPUT_SELECTOR = (
 )
 
 
+def _delay_seconds(value: Any, default: float, minimum: float = 1.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(parsed, minimum)
+
+
 def load_zhilian_city_snapshot() -> dict[str, Any]:
     """Load the isolated, local-only 智联 city snapshot without network access."""
     try:
@@ -519,12 +527,28 @@ class ZhilianCollector:
         *,
         browser: ZhilianBrowser | None = None,
         sleep: Callable[[float], None] = time.sleep,
-        delay_range: tuple[float, float] = (DETAIL_DELAY_MIN_SECONDS, DETAIL_DELAY_MAX_SECONDS),
+        delay_range: tuple[float, float] | None = None,
         uniform: Callable[[float, float], float] = random.SystemRandom().uniform,
+        config: dict[str, Any] | None = None,
     ):
         self.sleep = sleep
-        self.delay_range = delay_range
         self.uniform = uniform
+        if delay_range is not None:
+            self.delay_range = delay_range
+        else:
+            collection_cfg = config.get("collection", {}) if isinstance(config, dict) else {}
+            delay_min = _delay_seconds(
+                collection_cfg.get("zhilian_detail_delay_min_seconds"),
+                DETAIL_DELAY_MIN_SECONDS,
+            )
+            delay_max = max(
+                delay_min,
+                _delay_seconds(
+                    collection_cfg.get("zhilian_detail_delay_max_seconds"),
+                    DETAIL_DELAY_MAX_SECONDS,
+                ),
+            )
+            self.delay_range = (delay_min, delay_max)
         if browser is not None:
             self.browser = browser
         else:

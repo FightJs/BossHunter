@@ -622,6 +622,25 @@ class WebApiRouteTests(unittest.TestCase):
             "exhausted": False,
         })
 
+    def test_web_api_workbench_includes_latest_send_error_detail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("send-failed"))
+                update_job_greeting(db, "send-failed", "请问您最近方便沟通吗？")
+                update_job_status(db, "send-failed", "error")
+                add_history(db, "send-failed", "error", "无法找到沟通按钮")
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+
+            status, _, body = self._request("/api/workbench")
+
+        payload = json.loads(body)
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(payload["send_errors"][0]["last_error"], "无法找到沟通按钮")
+
     def test_web_api_workbench_shows_approved_job_when_greeting_was_interrupted(self):
         with tempfile.TemporaryDirectory() as tmp:
             base_dir = Path(tmp)
@@ -642,6 +661,30 @@ class WebApiRouteTests(unittest.TestCase):
             [job["id"] for job in payload["pending_confirmation"]],
             ["approved-without-greeting"],
         )
+
+    def test_workbench_greeting_run_without_selection_includes_read_only_platforms(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base_dir = Path(tmp)
+            db = get_db(base_dir / "data" / "bosshunter.db")
+            try:
+                insert_job(db, _job("zhilian-ready"))
+                db.execute("UPDATE jobs SET source_platform = ?, status = ? WHERE id = ?", ("zhilian", "ready", "zhilian-ready"))
+                db.commit()
+            finally:
+                db.close()
+            server.set_base_dir(base_dir)
+            resume_path = base_dir / "resume.md"
+            resume_path.write_text("# Resume", encoding="utf-8")
+            config = {"profile": {"resume_path": str(resume_path)}, "ai": {"api_key": "test-key"}}
+
+            with patch.object(server, "load_config", return_value=config), \
+                patch.object(server, "_preflight_messages", return_value=[]), \
+                patch.object(server.task_runner, "start", return_value={"id": "greet-task"}) as start:
+                status, _, body = self._request("/api/workbench/task", method="POST", json_body={"mode": "greet"})
+
+        self.assertTrue(status.startswith("200"), body)
+        self.assertEqual(start.call_args.args[0], "greet")
+        self.assertEqual(start.call_args.args[1]["_workbench_job_ids"], ["zhilian-ready"])
 
     def test_workbench_returns_today_and_cumulative_funnel_counts(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -785,17 +828,17 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertEqual(result["status"], "stopped")
         self.assertIsNone(runner.status()["active"])
 
-    def test_task_runner_automatically_stops_at_send_window_deadline(self):
+    def test_task_runner_automatically_stops_delivery_at_send_window_deadline(self):
         # Arrange
         def wait_for_stop(task, config):
             task.stop_requested.wait(timeout=1)
 
-        runner = WorkbenchTaskRunner({"monitor": wait_for_stop})
+        runner = WorkbenchTaskRunner({"deliver": wait_for_stop})
         deadline = datetime.now() + timedelta(milliseconds=50)
 
         # Act
         with patch("bosshunter.web.tasks._deadline_from_config", return_value=deadline):
-            task = runner.start("monitor", {"throttle": {"send_windows": ["09:00-16:00"]}})
+            task = runner.start("deliver", {"throttle": {"send_windows": ["09:00-16:00"]}})
             runner.wait(timeout=1)
         result = runner.status()["last_task"]
 
@@ -806,21 +849,34 @@ class WebApiRouteTests(unittest.TestCase):
         self.assertEqual(result["stop_reason"], "已到发送时间窗口截止时间，后台自动停止")
         self.assertIn(result["stop_reason"], result["logs"])
 
-    def test_task_runner_does_not_start_after_today_deadline(self):
+    def test_task_runner_does_not_start_delivery_after_today_deadline(self):
         # Arrange
         executed = Event()
-        runner = WorkbenchTaskRunner({"monitor": lambda task, config: executed.set()})
+        runner = WorkbenchTaskRunner({"deliver": lambda task, config: executed.set()})
         deadline = datetime.now() - timedelta(minutes=1)
 
         # Act
         with patch("bosshunter.web.tasks._deadline_from_config", return_value=deadline):
-            task = runner.start("monitor", {"throttle": {"send_windows": ["09:00-16:00"]}})
+            task = runner.start("deliver", {"throttle": {"send_windows": ["09:00-16:00"]}})
 
         # Assert
         self.assertEqual(task["status"], "stopped")
         self.assertEqual(task["stop_reason"], "今日发送时间窗口已截止，后台未启动")
         self.assertFalse(executed.is_set())
         self.assertIsNone(runner.status()["active"])
+
+    def test_task_runner_standalone_monitor_ignores_send_window_deadline(self):
+        # Arrange
+        executed = Event()
+        runner = WorkbenchTaskRunner({"monitor": lambda task, config: executed.set()})
+        # Act
+        task = runner.start("monitor", {"throttle": {"send_windows": ["09:00-16:00"]}})
+        runner.wait(timeout=1)
+
+        # Assert
+        self.assertIsNone(task["deadline_at"])
+        self.assertTrue(executed.is_set())
+        self.assertEqual(runner.status()["last_task"]["status"], "completed")
 
     def test_send_window_checker_uses_last_window_end_as_daily_deadline(self):
         checker = SendWindowChecker(["09:00-12:00", "14:00-17:30", "99:00-100:00"])
@@ -1242,7 +1298,7 @@ class WebApiRouteTests(unittest.TestCase):
             ],
         })
 
-        def stop_after_monitor(_config):
+        def stop_after_monitor(_config, **_kwargs):
             task.stop_requested.set()
 
         # Act

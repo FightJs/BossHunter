@@ -40,26 +40,26 @@ export function Sidebar({ pendingReplies: pendingRepliesProp }: SidebarProps) {
   }, [pendingRepliesProp])
 
   return (
-    <aside className="w-60 border-r border-card-border bg-white flex flex-col">
-      <div className="h-16 flex items-center px-5 border-b border-card-border">
+    <aside className="w-60 shrink-0 border-r border-card-border bg-white flex flex-col max-md:w-16">
+      <div className="h-16 flex items-center px-5 border-b border-card-border max-md:justify-center max-md:px-0">
         <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-2xl bg-primary text-white flex items-center justify-center shadow-lg shadow-primary/20">
+          <div className="w-10 h-10 shrink-0 rounded-2xl bg-primary text-white flex items-center justify-center shadow-lg shadow-primary/20">
             <span className="font-black text-sm">BH</span>
           </div>
-          <div>
+          <div className="max-md:hidden">
             <div className="font-black text-sm tracking-tight text-foreground">BossHunter</div>
             <div className="text-[11px] text-muted">v2.3.1 · 本地控制台</div>
           </div>
         </div>
       </div>
 
-      <nav className="flex-1 px-3 py-4 space-y-1">
+      <nav className="flex-1 px-3 py-4 space-y-1 max-md:px-2">
         {navItems.map(item => (
           <NavLink
             key={item.to}
             to={item.to}
             className={({ isActive }) =>
-              `flex items-center justify-between gap-3 px-3 py-3 rounded-xl text-sm transition-colors ${
+              `flex items-center justify-between gap-3 px-3 py-3 rounded-xl text-sm transition-colors max-md:justify-center max-md:px-0 ${
                 isActive
                   ? 'bg-[#FFF0E5] text-primary font-black'
                   : 'text-muted hover:text-foreground hover:bg-[#FFFCFA]'
@@ -68,7 +68,7 @@ export function Sidebar({ pendingReplies: pendingRepliesProp }: SidebarProps) {
           >
             <span className="flex items-center gap-3">
               <item.icon className="w-4 h-4" />
-              {item.label}
+              <span className="max-md:hidden">{item.label}</span>
             </span>
             {item.to === '/monitor' && pendingReplies > 0 && (
               <span className="h-2 w-2 rounded-full bg-danger" aria-label="有待处理事项" />
@@ -77,7 +77,7 @@ export function Sidebar({ pendingReplies: pendingRepliesProp }: SidebarProps) {
         ))}
       </nav>
 
-      <div className="px-4 py-4 border-t border-card-border space-y-3">
+      <div className="px-4 py-4 border-t border-card-border space-y-3 max-md:px-2">
         <a
           href={GITHUB_URL}
           target="_blank"
@@ -87,10 +87,10 @@ export function Sidebar({ pendingReplies: pendingRepliesProp }: SidebarProps) {
           <Github className="absolute left-3 h-4 w-4" />
           <span className="mx-auto flex items-center justify-center gap-2">
             <span className="text-xl leading-none text-yellow-400">★</span>
-            BossHunter
+            <span className="max-md:hidden">BossHunter</span>
           </span>
         </a>
-        <p className="text-center text-[11px] leading-5 text-muted">❤️  欢迎点 Star 支持维护  ❤️</p>
+        <p className="text-center text-[11px] leading-5 text-muted max-md:hidden">❤️  欢迎点 Star 支持维护  ❤️</p>
       </div>
     </aside>
   )

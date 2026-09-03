@@ -16,6 +16,7 @@ from copy import deepcopy
 from pathlib import Path
 from socketserver import ThreadingMixIn
 from threading import Event, Lock
+from typing import Any
 from uuid import uuid4
 from wsgiref.simple_server import WSGIServer
 
@@ -25,7 +26,7 @@ from bottle import Bottle, request, response, static_file, abort
 from bosshunter import __version__
 from bosshunter.ai.credentials import get_ai_api_key
 from bosshunter.cities import CityRefreshError, get_city_map, load_city_snapshot, refresh_city_cache
-from bosshunter.config import AI_SERVICE_PRESETS, load_config, remove_retired_collection_settings
+from bosshunter.config import AI_PROFILE_FIELDS, AI_SERVICE_PRESETS, _normalize_ai_profiles, load_config, remove_retired_collection_settings
 from bosshunter.db import (
 	JobDeletionConflictError,
 	JobManualSentConflictError,
@@ -68,6 +69,13 @@ from bosshunter.scoring_run_store import (
 	list_scoring_runs,
 	mark_orphaned_scoring_runs_paused,
 	update_scoring_run,
+)
+from bosshunter.greeting_run_store import (
+	create_greeting_run,
+	get_greeting_run,
+	list_greeting_runs,
+	mark_orphaned_greeting_runs_paused,
+	update_greeting_run,
 )
 from bosshunter.scoring_selection import preview_scoring, select_scoring_jobs, validate_options
 from bosshunter.web.preflight import check_ai_connection, collect_preflight_checks, error_messages
@@ -128,6 +136,7 @@ def set_base_dir(base_dir: Path | str) -> None:
 	RESUME_DIR = DATA_DIR / "resumes"
 	CONFIG_PATH = BASE_DIR / "config.yaml"
 	mark_orphaned_scoring_runs_paused(DATA_DIR / "bosshunter.db")
+	mark_orphaned_greeting_runs_paused(DATA_DIR / "bosshunter.db")
 	mark_orphaned_collection_runs_stopped(DATA_DIR / "bosshunter.db")
 
 
@@ -175,12 +184,13 @@ def _redact_config_for_response(config):
 	redacted = deepcopy(config)
 	ai_cfg = redacted.get("ai")
 	if isinstance(ai_cfg, dict):
-		key = ai_cfg.pop("api_key", None)
-		if key:
-			ai_cfg["api_key_masked"] = _mask_api_key(str(key))
-		auth_token = ai_cfg.pop("auth_token", None)
-		if auth_token:
-			ai_cfg["auth_token_masked"] = _mask_api_key(str(auth_token))
+		for entry in [ai_cfg, *(profile for profile in ai_cfg.get("profiles", []) if isinstance(profile, dict))]:
+			key = entry.pop("api_key", None)
+			if key:
+				entry["api_key_masked"] = _mask_api_key(str(key))
+			auth_token = entry.pop("auth_token", None)
+			if auth_token:
+				entry["auth_token_masked"] = _mask_api_key(str(auth_token))
 	return redacted
 
 
@@ -189,8 +199,9 @@ def _config_download_payload(config: dict) -> str:
 	redacted = _redact_config_for_response(config)
 	ai_cfg = redacted.get("ai")
 	if isinstance(ai_cfg, dict):
-		ai_cfg.pop("api_key_masked", None)
-		ai_cfg.pop("auth_token_masked", None)
+		for entry in [ai_cfg, *(profile for profile in ai_cfg.get("profiles", []) if isinstance(profile, dict))]:
+			entry.pop("api_key_masked", None)
+			entry.pop("auth_token_masked", None)
 	return yaml.dump(redacted, allow_unicode=True, default_flow_style=False, sort_keys=False)
 
 
@@ -228,41 +239,66 @@ def _sanitize_config_for_write(data):
 	if not isinstance(ai_cfg, dict):
 		return cleaned
 
-	ai_cfg.pop("api_key_masked", None)
-	ai_cfg.pop("has_api_key", None)
-	ai_cfg.pop("auth_token_masked", None)
-	ai_cfg.pop("has_auth_token", None)
-
 	existing_ai = load_config(CONFIG_PATH).get("ai", {})
-	service = ai_cfg.get("service") or existing_ai.get("service")
-	if service not in AI_SERVICE_PRESETS:
-		provider = ai_cfg.get("provider") or existing_ai.get("provider") or "anthropic"
-		service = "custom" if provider == "openai_compatible" else "anthropic"
-	ai_cfg["service"] = service
-	ai_cfg["provider"] = AI_SERVICE_PRESETS[service]["provider"]
+	existing_profiles = {
+		str(profile.get("id")): profile
+		for profile in existing_ai.get("profiles", [])
+		if isinstance(profile, dict) and profile.get("id")
+	}
 
-	clear_credentials = bool(ai_cfg.pop("clear_credentials", False))
+	# Older browser payloads have one flat connection. Convert them before
+	# preserving credentials so both payload formats stay safe to save.
+	if not isinstance(ai_cfg.get("profiles"), list):
+		ai_cfg["profiles"] = [{
+			"id": str(ai_cfg.get("active_profile_id") or "default"),
+			"name": str(ai_cfg.get("name") or "默认 API"),
+			"clear_credentials": bool(ai_cfg.get("clear_credentials", False)),
+			**{field: ai_cfg[field] for field in AI_PROFILE_FIELDS if field in ai_cfg},
+		}]
 
-	for field in ("api_key", "auth_token"):
-		if clear_credentials:
-			posted_value = ai_cfg.get(field)
-			if posted_value is None or str(posted_value).strip() == "":
-				ai_cfg.pop(field, None)
-			continue
-		posted_value = ai_cfg.get(field)
-		existing_value = existing_ai.get(field)
-		existing_mask = _mask_api_key(str(existing_value)) if existing_value else ""
-		should_preserve = (
-			posted_value is None
-			or str(posted_value).strip() == ""
-			or (existing_mask and posted_value == existing_mask)
-		)
+	for index, profile in enumerate(ai_cfg["profiles"]):
+		if not isinstance(profile, dict):
+			ai_cfg["profiles"][index] = profile = {}
+		profile_id = str(profile.get("id") or f"profile-{index + 1}").strip()
+		profile["id"] = profile_id
+		profile["name"] = str(profile.get("name") or f"AI 配置 {index + 1}").strip() or f"AI 配置 {index + 1}"
+		profile.pop("api_key_masked", None)
+		profile.pop("has_api_key", None)
+		profile.pop("auth_token_masked", None)
+		profile.pop("has_auth_token", None)
 
-		if should_preserve:
-			if existing_value:
-				ai_cfg[field] = existing_value
-			else:
-				ai_cfg.pop(field, None)
+		service = profile.get("service") or "anthropic"
+		if service not in AI_SERVICE_PRESETS:
+			provider = profile.get("provider") or "anthropic"
+			service = "custom" if provider == "openai_compatible" else "anthropic"
+		profile["service"] = service
+		profile["provider"] = AI_SERVICE_PRESETS[service]["provider"]
+		clear_credentials = bool(profile.pop("clear_credentials", False))
+		existing_profile = existing_profiles.get(profile_id, {})
+
+		for field in ("api_key", "auth_token"):
+			posted_value = profile.get(field)
+			if clear_credentials:
+				if posted_value is None or str(posted_value).strip() == "":
+					profile.pop(field, None)
+				continue
+			existing_value = existing_profile.get(field)
+			existing_mask = _mask_api_key(str(existing_value)) if existing_value else ""
+			should_preserve = (
+				posted_value is None
+				or str(posted_value).strip() == ""
+				or (existing_mask and posted_value == existing_mask)
+			)
+			if should_preserve:
+				if existing_value:
+					profile[field] = existing_value
+				else:
+					profile.pop(field, None)
+
+	_normalize_ai_profiles(ai_cfg)
+	# The active profile is now mirrored onto ai for runtime callers.
+	for field in ("api_key_masked", "has_api_key", "auth_token_masked", "has_auth_token", "clear_credentials"):
+		ai_cfg.pop(field, None)
 
 	return cleaned
 
@@ -270,7 +306,7 @@ def _sanitize_config_for_write(data):
 def _preflight_messages(mode: str, config: dict, options: dict | None = None) -> list[str]:
 	"""Return user-actionable blockers before starting a dashboard task."""
 	messages: list[str] = []
-	if mode not in {"full", "collect", "rescore", "monitor"}:
+	if mode not in {"full", "collect", "rescore", "score", "greet", "monitor"}:
 		messages.append(f"不支持的任务模式：{mode}")
 	if mode == "collect":
 		try:
@@ -288,7 +324,7 @@ def _preflight_messages(mode: str, config: dict, options: dict | None = None) ->
 
 	profile = config.get("profile", {})
 	resume_path = profile.get("resume_path", "")
-	if mode in {"full", "rescore"} and (not resume_path or not Path(str(resume_path)).exists()):
+	if mode in {"full", "rescore", "score", "greet"} and (not resume_path or not Path(str(resume_path)).exists()):
 		messages.append("请先在配置页上传 .md、.docx 或 .pdf 简历。")
 
 	if mode == "full":
@@ -300,7 +336,7 @@ def _preflight_messages(mode: str, config: dict, options: dict | None = None) ->
 			if not full_options.get("platform_order"):
 				messages.append("运行全流程至少需要选择一个采集平台。")
 
-	if mode in {"full", "rescore"} and not get_ai_api_key(config):
+	if mode in {"full", "rescore", "score", "greet"} and not get_ai_api_key(config):
 		messages.append("请先在配置页填写当前 AI 服务的 API Key，或设置对应的标准环境变量。")
 
 	return messages
@@ -344,10 +380,170 @@ def _record_score_progress(task: WorkbenchTask, state: dict) -> None:
 		"ai_filtered": int(state.get("filtered") or 0),
 		"ai_failed": int(state.get("failed") or 0),
 	})
+	active_jobs = state.get("active_jobs")
+	if not isinstance(active_jobs, list):
+		active_jobs = []
+	task.scoring_progress = {
+		"completed": task.metrics["ai_completed"],
+		"total": task.metrics["ai_total"],
+		"scored": task.metrics["ai_passed"],
+		"filtered": task.metrics["ai_filtered"],
+		"failed": task.metrics["ai_failed"],
+		"active_jobs": [
+			{
+				"id": str(item.get("id") or ""),
+				"company": str(item.get("company") or "未知公司"),
+				"title": str(item.get("title") or "未知岗位"),
+			}
+			for item in active_jobs
+			if isinstance(item, dict)
+		],
+	}
+	checkpoint = task.context.get("checkpoint")
+	run_id = str(checkpoint.get("run_id") or "") if isinstance(checkpoint, dict) else ""
+	if run_id:
+		remaining = checkpoint.get("remaining_job_ids", []) if isinstance(checkpoint, dict) else []
+		update_scoring_run(
+			DATA_DIR / "bosshunter.db",
+			run_id,
+			progress={**task.scoring_progress, "remaining": len(remaining) if isinstance(remaining, list) else 0},
+		)
 	_log(
 		task,
 		f"AI 评分进度 {state['completed']}/{state['total']}：通过 {state['scored']}，过滤 {state['filtered']}，失败 {state['failed']}",
 	)
+
+
+def _record_score_checkpoint(task: WorkbenchTask, state: dict, *, stage: str = "score", run_id: str = "") -> None:
+	"""Record scoring's remaining frozen selection on the in-memory task."""
+	remaining = [str(job_id) for job_id in state.get("remaining_job_ids", []) if str(job_id)]
+	status = str(state.get("status") or "running")
+	pause_reason = str(state.get("pause_reason") or "")
+	task.context["checkpoint"] = {
+		"stage": stage,
+		"run_id": run_id,
+		"remaining_job_ids": remaining,
+		"job_ids": remaining,
+	}
+	if status == "paused":
+		task.stop_reason = pause_reason or "AI 评分任务已暂停"
+		task.pause_requested.set()
+		task.stop_requested.set()
+
+
+def _record_greeting_progress(task: WorkbenchTask, state: dict) -> None:
+	"""Copy greeting counters into the task snapshot for the dashboard."""
+	current_job = state.get("current_job")
+	if isinstance(current_job, dict):
+		next_job = {
+			"id": str(current_job.get("id") or ""),
+			"company": str(current_job.get("company") or "未知公司"),
+			"title": str(current_job.get("title") or "未知岗位"),
+		}
+		if task.current_job != next_job:
+			_log(task, f"正在生成招呼语：{next_job['company']}｜{next_job['title']}")
+		task.current_job = next_job
+	else:
+		task.current_job = None
+	task.metrics.update({
+		"greeting_completed": int(state.get("completed") or 0),
+		"greeting_total": int(state.get("total") or 0),
+		"greeting_generated": int(state.get("generated") or 0),
+		"greeting_failed": int(state.get("failed") or 0),
+	})
+	task.greeting_progress = {
+		"completed": task.metrics["greeting_completed"],
+		"total": task.metrics["greeting_total"],
+		"generated": task.metrics["greeting_generated"],
+		"failed": task.metrics["greeting_failed"],
+		"current_job": dict(task.current_job) if task.current_job else None,
+	}
+	# Keep the durable run in sync while a worker is waiting on the model.  The
+	# task snapshot is enough for an open tab, but a restart/reload reads this
+	# record instead and should still know the total, generated count, and active
+	# job.  Include both readable keys and the task metric names for older
+	# consumers that already use ``greeting_*``.
+	checkpoint = task.context.get("checkpoint")
+	run_id = str(checkpoint.get("run_id") or "") if isinstance(checkpoint, dict) else ""
+	if run_id:
+		remaining = checkpoint.get("remaining_job_ids", []) if isinstance(checkpoint, dict) else []
+		progress = {
+			**task.metrics,
+			"completed": task.metrics["greeting_completed"],
+			"total": task.metrics["greeting_total"],
+			"generated": task.metrics["greeting_generated"],
+			"failed": task.metrics["greeting_failed"],
+			"remaining": len(remaining) if isinstance(remaining, list) else 0,
+			"current_job": dict(task.current_job) if task.current_job else None,
+		}
+		update_greeting_run(DATA_DIR / "bosshunter.db", run_id, progress=progress)
+
+
+def _record_greeting_checkpoint(task: WorkbenchTask, state: dict, *, run_id: str = "") -> None:
+	"""Keep the task and (when present) durable run at the same boundary."""
+	remaining = [str(job_id) for job_id in state.get("remaining_job_ids", []) if str(job_id)]
+	status = str(state.get("status") or "running")
+	pause_reason = str(state.get("pause_reason") or "")
+	checkpoint = {
+		"stage": "greeting",
+		"run_id": run_id,
+		"remaining_job_ids": remaining,
+		"job_ids": remaining,
+	}
+	task.context["checkpoint"] = checkpoint
+	if run_id:
+		progress = {
+			**task.metrics,
+			"completed": int(task.metrics.get("greeting_completed") or 0),
+			"total": int(task.metrics.get("greeting_total") or 0),
+			"generated": int(task.metrics.get("greeting_generated") or 0),
+			"failed": int(task.metrics.get("greeting_failed") or 0),
+			"remaining": len(remaining),
+			"current_job": dict(task.current_job) if task.current_job else None,
+		}
+		update_greeting_run(
+			DATA_DIR / "bosshunter.db",
+			run_id,
+			status=status,
+			remaining_job_ids=remaining,
+			progress=progress,
+			pause_reason=pause_reason if status == "paused" else None,
+		)
+	if status == "paused":
+		task.stop_reason = pause_reason or "招呼语生成任务已暂停"
+		task.pause_requested.set()
+		task.stop_requested.set()
+
+
+def _record_send_progress(task: WorkbenchTask, state: dict) -> None:
+	"""Copy live greeting-delivery counters into the task snapshot."""
+	current_job = state.get("current_job")
+	if isinstance(current_job, dict):
+		next_job = {
+			"id": str(current_job.get("id") or ""),
+			"company": str(current_job.get("company") or "未知公司"),
+			"title": str(current_job.get("title") or "未知岗位"),
+		}
+		if task.current_job != next_job:
+			_log(task, f"正在投递：{next_job['company']}｜{next_job['title']}")
+		task.current_job = next_job
+	else:
+		task.current_job = None
+	task.metrics.update({
+		"send_requested": int(state.get("total") or 0),
+		"send_attempted": int(state.get("attempted") or 0),
+		"send_success": int(state.get("sent") or 0),
+		"send_failed": int(state.get("failed") or 0),
+	})
+	task.send_progress = {
+		"total": task.metrics["send_requested"],
+		"attempted": task.metrics["send_attempted"],
+		"sent": task.metrics["send_success"],
+		"failed": task.metrics["send_failed"],
+		"deferred": max(int(state.get("deferred") or 0), 0),
+		"current_job": dict(task.current_job) if task.current_job else None,
+		"status": str(state.get("status") or "running"),
+	}
 
 
 def _execute_collect(task: WorkbenchTask, config: dict) -> None:
@@ -355,8 +551,10 @@ def _execute_collect(task: WorkbenchTask, config: dict) -> None:
 	_set_checkpoint(task, "collect")
 	_log(task, "开始采集岗位")
 	collect_config = dict(config)
+	collect_config["_workbench_db_path"] = str(DATA_DIR / "bosshunter.db")
 	collect_config["_workbench_stop_event"] = task.stop_requested
 	collect_config["_workbench_pause_event"] = task.pause_requested
+	collect_config["_workbench_score_checkpoint"] = lambda state: _record_score_checkpoint(task, state, stage="score")
 	if isinstance(previous_checkpoint, dict) and previous_checkpoint.get("run_id"):
 		collect_config["_workbench_resume_run_id"] = str(previous_checkpoint["run_id"])
 	collect_config["_workbench_collect_progress"] = lambda state: _record_collect_progress(task, state)
@@ -376,9 +574,12 @@ def _execute_collect(task: WorkbenchTask, config: dict) -> None:
 		_log(task, f"本轮采集完成：扫描 {task.metrics.get('collect_seen', 0)}，新增 {task.metrics.get('collect_new', 0)}，重复 {task.metrics.get('collect_duplicate', 0)}")
 		_log(task, f"开始 AI 评分：处理全部未评分岗位（本轮新增 {len(collected_job_ids)} 个）")
 		score_config = dict(config)
+		score_config["_workbench_db_path"] = str(DATA_DIR / "bosshunter.db")
 		score_config["_workbench_stop_event"] = task.stop_requested
+		score_config["_workbench_pause_event"] = task.pause_requested
 		score_config["_workbench_log"] = lambda message: _log(task, message)
 		score_config["_workbench_score_progress"] = lambda state: _record_score_progress(task, state)
+		score_config["_workbench_score_checkpoint"] = lambda state: _record_score_checkpoint(task, state, stage="score")
 		score_jobs(score_config)
 		return
 
@@ -430,44 +631,154 @@ def _stop_or_log_boss_collection_reason(task: WorkbenchTask, stop_reason: str) -
 
 def _execute_rescore(task: WorkbenchTask, config: dict) -> None:
 	from bosshunter.ai.scorer import score_jobs
+	if config.get("_score_run_id"):
+		# A workbench re-score uses the same durable/checkpointed worker as an
+		# ordinary score run.  The selected snapshot contains only AI-filtered
+		# jobs, so resuming never resets or consumes a newer pool entry.
+		rescore_config = dict(config)
+		rescore_config["_workbench_score_stage"] = "rescore"
+		_execute_score(task, rescore_config)
+		return
 
 	score_config = dict(config)
+	score_config["_workbench_db_path"] = str(DATA_DIR / "bosshunter.db")
 	score_config["_workbench_stop_event"] = task.stop_requested
+	score_config["_workbench_pause_event"] = task.pause_requested
 	score_config["_workbench_log"] = lambda message: _log(task, message)
 	score_config["_workbench_score_progress"] = lambda state: _record_score_progress(task, state)
+	score_config["_workbench_score_checkpoint"] = lambda state: _record_score_checkpoint(task, state, stage="rescore")
 	_set_checkpoint(task, "rescore")
 	_log(task, "开始重新评分")
 	score_jobs(score_config, rescore_filtered=True)
+
+
+def _execute_greet(task: WorkbenchTask, config: dict) -> None:
+	"""Generate greetings as an independent, AI-only workbench task.
+
+	Greeting generation deliberately does not open Chrome or send anything.  It
+	can therefore run alongside collection and scoring of unrelated jobs; the
+	resulting jobs remain in ``ready`` until a separate delivery action is
+	confirmed.
+	"""
+	from bosshunter.ai.greeter import generate_greetings
+
+	run_id = str(config.get("_greeting_run_id") or "")
+	previous_checkpoint = task.context.get("checkpoint")
+	selected_job_ids = [str(job_id) for job_id in config.get("_workbench_job_ids", []) if str(job_id)]
+	if isinstance(previous_checkpoint, dict) and task.context.get("resume_requested"):
+		checkpoint_ids = previous_checkpoint.get("remaining_job_ids", previous_checkpoint.get("job_ids", []))
+		if isinstance(checkpoint_ids, list):
+			selected_job_ids = [str(job_id) for job_id in checkpoint_ids if str(job_id)]
+		if not run_id:
+			run_id = str(previous_checkpoint.get("run_id") or "")
+	_set_checkpoint(
+		task,
+		"greeting",
+		job_ids=selected_job_ids,
+		remaining_job_ids=selected_job_ids,
+		run_id=run_id,
+	)
+	# Seed the snapshot before the worker makes its first model call.  This
+	# avoids a blank progress card during the first polling interval and gives
+	# the durable run the frozen total immediately.
+	task.metrics.update({
+		"greeting_completed": 0,
+		"greeting_total": len(selected_job_ids),
+		"greeting_generated": 0,
+		"greeting_failed": 0,
+	})
+	task.greeting_progress = {
+		"completed": 0,
+		"total": len(selected_job_ids),
+		"generated": 0,
+		"failed": 0,
+		"current_job": None,
+	}
+	_greet_config = dict(config)
+	_greet_config["_workbench_db_path"] = str(DATA_DIR / "bosshunter.db")
+	_greet_config["_workbench_include_ready"] = True
+	_greet_config["_workbench_stop_event"] = task.stop_requested
+	_greet_config["_workbench_pause_event"] = task.pause_requested
+	_greet_config["_workbench_log"] = lambda message: _log(task, message)
+	_greet_config["_workbench_greeting_progress"] = lambda state: _record_greeting_progress(task, state)
+	_greet_config["_workbench_greeting_checkpoint"] = lambda state: _record_greeting_checkpoint(
+		task,
+		state,
+		run_id=run_id,
+	)
+	_log(task, "开始生成招呼语")
+	try:
+		generated_count = generate_greetings(_greet_config)
+	except Exception as exc:
+		if run_id:
+			update_greeting_run(
+				DATA_DIR / "bosshunter.db",
+				run_id,
+				status="failed",
+				error=str(exc)[:1000],
+			)
+		raise
+	task.metrics["greeting_generated"] = int(generated_count or 0)
+	task.metrics["greeting_requested"] = len(selected_job_ids)
+	_log(
+		task,
+		f"招呼语生成完成：{generated_count}/{len(selected_job_ids) or generated_count}",
+	)
 
 
 def _execute_score(task: WorkbenchTask, config: dict) -> None:
 	from bosshunter.ai.scorer import score_jobs
 
 	run_id = str(config.get("_score_run_id") or "")
+	checkpoint_stage = str(config.get("_workbench_score_stage") or "score")
 	options = config.get("_score_options", {}) if isinstance(config.get("_score_options"), dict) else {}
 	db_path = DATA_DIR / "bosshunter.db"
+	# The Jobs page uses durable scoring runs.  The workbench's lightweight
+	# “单独 AI 评分” action intentionally remains usable without creating a
+	# second durable record; it scores the current pending pool directly.
+	if not run_id:
+		score_config = dict(config)
+		score_config["_workbench_db_path"] = str(DATA_DIR / "bosshunter.db")
+		score_config["_workbench_stop_event"] = task.stop_requested
+		score_config["_workbench_pause_event"] = task.pause_requested
+		score_config["_workbench_log"] = lambda message: _log(task, message)
+		score_config["_workbench_score_progress"] = lambda state: _record_score_progress(task, state)
+		_set_checkpoint(task, checkpoint_stage)
+		_log(task, "开始单独 AI 评分")
+		score_jobs(
+			score_config,
+			scope=str(options.get("scope") or "selected") if options else "pending",
+			limit=options.get("limit") if options else None,
+			job_ids=list(options.get("job_ids") or []) if options else None,
+			force_rescore=bool(options.get("force_rescore")) if options else False,
+		)
+		return
 
 	def checkpoint(state: dict) -> None:
 		remaining = [str(job_id) for job_id in state.get("remaining_job_ids", []) if str(job_id)]
 		status = str(state.get("status") or "running")
+		_record_score_checkpoint(task, state, stage=checkpoint_stage, run_id=run_id)
 		update_scoring_run(
 			db_path,
 			run_id,
 			status=status,
 			remaining_job_ids=remaining,
-			progress={**task.metrics, "remaining": len(remaining)},
+			progress={**task.metrics, **task.scoring_progress, "remaining": len(remaining)},
 			pause_reason=str(state.get("pause_reason") or "") if status == "paused" else None,
 		)
 		if status == "paused":
 			task.stop_reason = str(state.get("pause_reason") or "评分任务已暂停")
+			task.pause_requested.set()
 			task.stop_requested.set()
 
 	score_config = dict(config)
+	score_config["_workbench_db_path"] = str(DATA_DIR / "bosshunter.db")
 	score_config["_workbench_stop_event"] = task.stop_requested
+	score_config["_workbench_pause_event"] = task.pause_requested
 	score_config["_workbench_log"] = lambda message: _log(task, message)
 	score_config["_workbench_score_progress"] = lambda state: _record_score_progress(task, state)
 	score_config["_workbench_score_checkpoint"] = checkpoint
-	_set_checkpoint(task, "score", run_id=run_id)
+	_set_checkpoint(task, checkpoint_stage, run_id=run_id)
 	_log(task, f"开始单独 AI 评分：{len(options.get('job_ids', []))} 个岗位")
 	try:
 		score_jobs(
@@ -550,7 +861,10 @@ def _execute_monitor(task: WorkbenchTask, config: dict, *, initial_cooldown: boo
 				if task.stop_requested.is_set():
 					return
 			_log(task, "执行一轮监测")
-			summary = monitor_and_send_resumes(monitor_config)
+			summary = monitor_and_send_resumes(
+				monitor_config,
+				allow_outside_send_window=task.mode == "monitor",
+			)
 			if task.stop_requested.is_set():
 				return
 			stop_reason = summary.get("stop_reason")
@@ -587,7 +901,7 @@ def _execute_full(task: WorkbenchTask, config: dict) -> None:
 		_execute_monitor(task, load_config(CONFIG_PATH), initial_cooldown=False)
 		return
 
-	if stage == "deliver":
+	if stage in {"deliver", "greeting", "send"}:
 		job_ids = [str(job_id) for job_id in checkpoint.get("job_ids", []) if str(job_id)]
 		if job_ids:
 			deliver_config = load_config(CONFIG_PATH)
@@ -734,7 +1048,7 @@ def _execute_deliver(task: WorkbenchTask, config: dict) -> None:
 			str(job_id) for job_id in config.get("_workbench_job_ids", []) if str(job_id)
 		)
 
-	current_config = config
+	current_config = _resume_delivery_config(task, config)
 	try:
 		while not task.stop_requested.is_set():
 			_execute_deliver_batch(task, current_config)
@@ -755,6 +1069,40 @@ def _execute_deliver(task: WorkbenchTask, config: dict) -> None:
 			task.context["delivering"] = False
 			task.context.pop("delivery_scheduled_ids", None)
 			task.context.pop("pending_deliveries", None)
+
+
+def _resume_delivery_config(task: WorkbenchTask, config: dict) -> dict:
+	"""Narrow a resumed delivery task to the jobs still pending at its checkpoint."""
+	checkpoint = task.context.get("checkpoint")
+	if not isinstance(checkpoint, dict) or checkpoint.get("stage") not in {"greeting", "send"}:
+		return config
+	target_ids = [str(job_id) for job_id in checkpoint.get("job_ids", []) if str(job_id)]
+	if not target_ids:
+		return config
+	db = _get_web_db()
+	try:
+		placeholders = ",".join("?" for _ in target_ids)
+		rows = db.execute(
+			f"SELECT id, status, greeting FROM jobs WHERE deleted_at IS NULL AND id IN ({placeholders})",
+			target_ids,
+		).fetchall()
+	finally:
+		db.close()
+	by_id = {str(row["id"]): dict(row) for row in rows}
+	if checkpoint["stage"] == "greeting":
+		remaining = [job_id for job_id in target_ids if by_id.get(job_id, {}).get("status") == "approved"]
+		resumed = dict(config)
+		resumed["_workbench_job_ids"] = remaining
+		return resumed
+	remaining = [
+		job_id for job_id in target_ids
+		if by_id.get(job_id, {}).get("status") in {"ready", "approved"}
+		and str(by_id.get(job_id, {}).get("greeting") or "").strip()
+	]
+	resumed = dict(config)
+	resumed["_workbench_job_ids"] = remaining
+	resumed["_workbench_skip_greeting"] = True
+	return resumed
 
 
 def _stop_for_active_platform_lock(task: WorkbenchTask) -> bool:
@@ -816,10 +1164,13 @@ def _execute_deliver_batch(task: WorkbenchTask, config: dict) -> None:
 	from bosshunter.executor.sender import send_greetings
 
 	config = dict(config)
+	config["_workbench_db_path"] = str(DATA_DIR / "bosshunter.db")
 	config["_workbench_stop_event"] = task.stop_requested
+	config["_workbench_pause_event"] = task.pause_requested
 	config["_workbench_log"] = lambda message: _log(task, message)
 	selected_job_ids = [str(job_id) for job_id in config.get("_workbench_job_ids", []) if str(job_id)]
 	if not config.get("_workbench_skip_greeting"):
+		_set_checkpoint(task, "greeting", job_ids=selected_job_ids)
 		_log(task, "生成招呼语")
 		generated_count = generate_greetings(config)
 		_log(task, f"招呼语生成完成：{generated_count}/{len(selected_job_ids) or generated_count}")
@@ -829,7 +1180,9 @@ def _execute_deliver_batch(task: WorkbenchTask, config: dict) -> None:
 			raise RuntimeError(
 				f"招呼语生成失败：选择 {len(selected_job_ids)} 个岗位，仅成功生成 {generated_count} 条；未发送任何消息"
 			)
+	_set_checkpoint(task, "send", job_ids=selected_job_ids)
 	_log(task, "发送招呼语")
+	config["_workbench_send_progress"] = lambda state: _record_send_progress(task, state)
 	# The workbench must obey the same send window and day-off guard as the CLI.
 	# ``force`` remains an explicit CLI-only override and is never implied by a
 	# browser button click.
@@ -852,6 +1205,10 @@ def _execute_deliver_batch(task: WorkbenchTask, config: dict) -> None:
 		"send_daily_limit": int(report.get("daily_limit", 0) or 0),
 		"send_remaining_quota": int(report.get("remaining_quota", 0) or 0),
 	})
+	if task.stop_requested.is_set():
+		remaining = _resume_delivery_config(task, config).get("_workbench_job_ids", [])
+		task.metrics["send_remaining"] = len(remaining)
+		_log(task, f"投递已在断点暂停，剩余 {len(remaining)} 个岗位可继续发送")
 	total_count = len(selected_job_ids) or sent_count + failed_count + deferred_count
 	_log(
 		task,
@@ -867,6 +1224,8 @@ def _execute_deliver_batch(task: WorkbenchTask, config: dict) -> None:
 	stop_reason = report.get("stop_reason")
 	if stop_reason:
 		task.stop_reason = str(stop_reason)
+	if stop_reason == "boss_login_required":
+		raise RuntimeError("BOSS 直聘登录状态已失效，请先在已连接的 Chrome 中重新登录后重新发送")
 	if stop_reason in {"captcha", "rate_limit", "blocked", "consecutive_errors"}:
 		reason_labels = {
 			"captcha": "验证码",
@@ -881,6 +1240,7 @@ task_runner._executors.update({
 	"full": _execute_full,
 	"collect": _execute_collect,
 	"rescore": _execute_rescore,
+	"greet": _execute_greet,
 	"score": _execute_score,
 	"monitor": _execute_monitor,
 	"deliver": _execute_deliver,
@@ -1133,14 +1493,37 @@ def api_workbench():
 		).fetchone()
 		today_sent = int(today_sent_row["cnt"] if today_sent_row else 0)
 		status = task_runner.status()
+		scoring_runs = [
+			run for run in list_scoring_runs(DATA_DIR / "bosshunter.db", limit=20)
+			if run.get("status") in {"running", "paused"}
+		]
+		greeting_runs = [
+			run for run in list_greeting_runs(DATA_DIR / "bosshunter.db", limit=20)
+			if run.get("status") in {"running", "paused"}
+		]
+		pending_confirmation = [
+			job for job in get_jobs_pending_confirmation(db)
+			if int(job.get("score") or 0) >= threshold
+			and platform_supports(str(job.get("source_platform") or "boss"), "deliver")
+		]
+		today_pending_confirmation = [
+			job for job in db.execute(
+				"""SELECT * FROM jobs
+				   WHERE deleted_at IS NULL
+				     AND status IN ('ready', 'approved')
+				     AND (greeting IS NULL OR TRIM(greeting) = '')
+				     AND score >= ?
+				     AND created_at >= datetime('now', 'localtime', 'start of day', 'utc')
+				   ORDER BY score DESC""",
+				(int(threshold),),
+			).fetchall()
+			if platform_supports(str(job["source_platform"] or "boss"), "deliver")
+		]
 		return _json_response({
 			"funnel": get_funnel_stats(db),
 			"funnel_today": get_funnel_stats(db, today=True),
-			"pending_confirmation": [
-				job for job in get_jobs_pending_confirmation(db)
-				if int(job.get("score") or 0) >= threshold
-				and platform_supports(str(job.get("source_platform") or "boss"), "deliver")
-			],
+			"pending_confirmation": pending_confirmation,
+			"today_pending_confirmation": [dict(job) for job in today_pending_confirmation],
 			"pending_greetings": [
 				job for job in get_jobs_ready_to_send(db)
 				if platform_supports(str(job.get("source_platform") or "boss"), "deliver")
@@ -1160,7 +1543,15 @@ def api_workbench():
 				"exhausted": today_sent >= daily_limit,
 			},
 			"task": status["active"],
+			"active_tasks": status.get("active_tasks", [status["active"]] if status.get("active") else []),
+			"paused_tasks": [item for item in status.get("tasks", []) if item.get("status") == "paused"],
+			"tasks": status.get("tasks", []),
 			"last_task": status["last_task"],
+			# Durable scoring and greeting runs survive an app restart, while
+			# task_runner is intentionally in-memory. Expose them to the workbench
+			# so a paused run cannot silently disappear.
+			"scoring_runs": scoring_runs,
+			"greeting_runs": greeting_runs,
 		})
 	finally:
 		db.close()
@@ -1284,9 +1675,9 @@ def api_scoring_pause(run_id):
 	if run.get("status") != "running":
 		return _json_response(run)
 	try:
-		task = task_runner.stop(str(run.get("task_id") or ""), "用户暂停独立评分")
-	except KeyError:
-		task = {"status": "stopped"}
+		task = task_runner.pause(str(run.get("task_id") or ""), "用户暂停独立评分")
+	except (KeyError, ValueError):
+		task = {"status": "paused"}
 	latest = get_scoring_run(db_path, run_id) or run
 	if task.get("status") not in {"completed", "failed"} and latest.get("remaining_job_ids"):
 		latest = update_scoring_run(db_path, run_id, status="paused", pause_reason="用户暂停独立评分") or latest
@@ -1347,10 +1738,138 @@ def api_scoring_end(run_id):
 	if run.get("status") == "running" and run.get("task_id"):
 		try:
 			task_runner.stop(str(run["task_id"]), "用户结束独立评分")
-		except KeyError:
+		except (KeyError, ValueError):
 			pass
 	ended = update_scoring_run(db_path, run_id, status="stopped", remaining_job_ids=[])
 	return _json_response(ended)
+
+
+@app.route("/api/greeting/runs")
+def api_greeting_runs():
+	return _json_response(list_greeting_runs(DATA_DIR / "bosshunter.db"))
+
+
+@app.route("/api/greeting/runs/<run_id>")
+def api_greeting_run_detail(run_id):
+	run = get_greeting_run(DATA_DIR / "bosshunter.db", run_id)
+	if not run:
+		return _json_response({"error": "招呼语生成运行记录不存在"}, 404)
+	return _json_response(run)
+
+
+@app.route("/api/greeting/runs/<run_id>/pause", method="POST")
+def api_greeting_pause(run_id):
+	db_path = DATA_DIR / "bosshunter.db"
+	run = get_greeting_run(db_path, run_id)
+	if not run:
+		return _json_response({"error": "招呼语生成任务不存在"}, 404)
+	if run.get("status") != "running":
+		return _json_response(run)
+	task_id = str(run.get("task_id") or "")
+	if task_id:
+		try:
+			task_runner.pause(task_id, "用户暂停招呼语生成")
+		except (KeyError, ValueError):
+			# The worker may have disappeared during an application restart.  The
+			# durable checkpoint is still valid and can be resumed below.
+			pass
+	paused = update_greeting_run(
+		db_path,
+		run_id,
+		status="paused",
+		pause_reason="用户暂停招呼语生成",
+	)
+	return _json_response(paused or run)
+
+
+def _eligible_greeting_ids(job_ids: list[str]) -> list[str]:
+	"""Return frozen IDs that are still ready/approved and lack a greeting."""
+	if not job_ids:
+		return []
+	db = _get_web_db()
+	try:
+		placeholders = ",".join("?" for _ in job_ids)
+		rows = db.execute(
+			f"""SELECT id, status, greeting, COALESCE(source_platform, 'boss') AS source_platform
+                FROM jobs
+                WHERE deleted_at IS NULL AND id IN ({placeholders})""",
+			job_ids,
+		).fetchall()
+	finally:
+		db.close()
+	return [
+		str(row["id"])
+		for row in rows
+		if str(row["status"] or "") in {"ready", "approved"}
+		and not str(row["greeting"] or "").strip()
+		and platform_supports(str(row["source_platform"] or "boss"), "greet")
+	]
+
+
+@app.route("/api/greeting/runs/<run_id>/resume", method="POST")
+def api_greeting_resume(run_id):
+	db_path = DATA_DIR / "bosshunter.db"
+	run = get_greeting_run(db_path, run_id)
+	if not run:
+		return _json_response({"error": "招呼语生成任务不存在"}, 404)
+	if run.get("status") != "paused":
+		return _json_response({"error": "只有已暂停的招呼语任务可以恢复"}, 409)
+	remaining = [str(job_id) for job_id in run.get("remaining_job_ids", []) if str(job_id)]
+	remaining = _eligible_greeting_ids(remaining)
+	if not remaining:
+		completed = update_greeting_run(db_path, run_id, status="completed", remaining_job_ids=[])
+		return _json_response(completed or run)
+	config = load_config(CONFIG_PATH)
+	messages = _preflight_messages("greet", config)
+	if messages:
+		return _json_response({"error": "请先处理招呼语启动检查", "messages": messages}, 400)
+	resume_config = _task_config({
+		"_greeting_run_id": run_id,
+		"_workbench_job_ids": remaining,
+	})
+	try:
+		with job_mutation_lock:
+			update_greeting_run(
+				db_path,
+				run_id,
+				status="running",
+				remaining_job_ids=remaining,
+			)
+			old_task_id = str(run.get("task_id") or "")
+			old_task = task_runner._tasks.get(old_task_id) if old_task_id else None
+			if old_task is not None and old_task.status == "paused":
+				task = task_runner.resume(old_task_id, resume_config)
+			else:
+				task = task_runner.start("greet", resume_config)
+		update_greeting_run(db_path, run_id, task_id=str(task.get("id") or ""))
+		return _json_response({"run": get_greeting_run(db_path, run_id), "task": task})
+	except TaskAlreadyRunningError as exc:
+		update_greeting_run(db_path, run_id, status="paused", pause_reason=str(exc))
+		return _json_response({"error": str(exc)}, 409)
+	except Exception as exc:
+		update_greeting_run(db_path, run_id, status="paused", pause_reason=str(exc)[:1000])
+		return _json_response({"error": "恢复招呼语任务失败", "detail": str(exc)}, 500)
+
+
+@app.route("/api/greeting/runs/<run_id>/end", method="POST")
+def api_greeting_end(run_id):
+	db_path = DATA_DIR / "bosshunter.db"
+	run = get_greeting_run(db_path, run_id)
+	if not run:
+		return _json_response({"error": "招呼语生成任务不存在"}, 404)
+	if run.get("status") in {"running", "paused"} and run.get("task_id"):
+		try:
+			task_runner.stop(str(run["task_id"]), "用户结束招呼语生成")
+		except (KeyError, ValueError):
+			pass
+	ended = update_greeting_run(db_path, run_id, status="stopped", remaining_job_ids=[])
+	return _json_response(ended or run)
+
+
+@app.route("/api/greeting/runs/<run_id>/stop", method="POST")
+def api_greeting_stop(run_id):
+	"""Alias using the same verb as generic workbench task controls."""
+	return api_greeting_end(run_id)
 
 
 @app.route("/api/workbench/task", method="POST")
@@ -1363,6 +1882,8 @@ def api_workbench_task_start():
 		base_config = load_config(CONFIG_PATH)
 		options = body.get("options") if isinstance(body.get("options"), dict) else None
 		collection_options = None
+		extra: dict[str, Any] = {}
+		durable_run_id = ""
 		if mode == "collect":
 			try:
 				collection_options = normalize_collection_options(base_config, options)
@@ -1383,10 +1904,140 @@ def api_workbench_task_start():
 					"collection_only_platforms": collection_only,
 				}, 400)
 			collection_options["auto_score"] = True
+		elif mode == "greet":
+			active_greeting_runs = [
+				run for run in list_greeting_runs(DATA_DIR / "bosshunter.db", limit=100)
+				if run.get("status") in {"running", "paused"}
+			]
+			if active_greeting_runs:
+				return _json_response({"error": "已有招呼语生成任务正在运行或等待恢复，请先继续或结束该任务"}, 409)
+			# A greeting run may target selected approved jobs or, when omitted,
+			# all currently approved/ready jobs. The workbench's standalone action sends
+			# ``scope=today_pending`` and freezes the same list shown in 今日待确认;
+			# the legacy no-scope API behavior remains available to older clients.
+			greeting_options = options if isinstance(options, dict) else {}
+			greeting_scope = str(greeting_options.get("scope") or "").strip()
+			raw_job_ids = greeting_options.get("job_ids", [])
+			if raw_job_ids is None:
+				raw_job_ids = []
+			if not isinstance(raw_job_ids, list):
+				return _json_response({"error": "招呼语岗位 ID 必须是数组"}, 400)
+			job_ids = []
+			for value in raw_job_ids:
+				if not isinstance(value, str):
+					return _json_response({"error": "招呼语岗位 ID 必须是字符串"}, 400)
+				job_id = value.strip()
+				if job_id and job_id not in job_ids:
+					job_ids.append(job_id)
+			if len(job_ids) > 1000:
+				return _json_response({"error": "一次最多生成 1000 个岗位的招呼语"}, 400)
+			if greeting_scope == "today_pending":
+				validation_db = _get_web_db()
+				try:
+					threshold = int(base_config.get("scoring", {}).get("threshold", 60) or 60)
+					pending_rows = [
+						job for job in validation_db.execute(
+							"""SELECT * FROM jobs
+							   WHERE deleted_at IS NULL
+							     AND status IN ('ready', 'approved')
+							     AND (greeting IS NULL OR TRIM(greeting) = '')
+							     AND score >= ?
+							     AND created_at >= datetime('now', 'localtime', 'start of day', 'utc')
+							   ORDER BY score DESC""",
+							(threshold,),
+						).fetchall()
+						if platform_supports(str(job["source_platform"] or "boss"), "deliver")
+					]
+				finally:
+					validation_db.close()
+				pending_ids = [str(job["id"]) for job in pending_rows if str(job["id"])]
+				if not job_ids:
+					job_ids = pending_ids
+				else:
+					outside_scope = [job_id for job_id in job_ids if job_id not in pending_ids]
+					if outside_scope:
+						return _json_response({
+							"error": "单独生成招呼语只能处理“今日待确认”中的岗位",
+							"invalid_ids": outside_scope,
+						}, 409)
+				if not job_ids:
+					return _json_response({"error": "今天暂时没有待确认岗位可生成招呼语"}, 400)
+			elif job_ids:
+				validation_db = _get_web_db()
+				try:
+					placeholders = ",".join("?" for _ in job_ids)
+					rows = validation_db.execute(
+						f"SELECT id, status, COALESCE(source_platform, 'boss') AS source_platform FROM jobs WHERE deleted_at IS NULL AND id IN ({placeholders})",
+						job_ids,
+					).fetchall()
+				finally:
+					validation_db.close()
+				by_id = {str(row["id"]): dict(row) for row in rows}
+				missing = [job_id for job_id in job_ids if job_id not in by_id]
+				not_approved = [
+					job_id for job_id in job_ids
+					if job_id in by_id and str(by_id[job_id]["status"] or "") not in {"ready", "approved"}
+				]
+				if missing:
+					return _json_response({"error": "所选岗位不存在或已进入回收站", "invalid_ids": missing}, 409)
+				if not_approved:
+					return _json_response({"error": "只有评分通过（ready/approved）的岗位可以生成招呼语", "invalid_ids": not_approved}, 409)
+			else:
+				validation_db = _get_web_db()
+				try:
+					approved_rows = validation_db.execute(
+						"SELECT id, COALESCE(source_platform, 'boss') AS source_platform FROM jobs WHERE deleted_at IS NULL AND status IN ('ready', 'approved') AND (greeting IS NULL OR TRIM(greeting) = '')"
+					).fetchall()
+				finally:
+					validation_db.close()
+				job_ids = [
+					str(row["id"])
+					for row in approved_rows
+					if platform_supports(str(row["source_platform"] or "boss"), "greet")
+				]
+				if not job_ids:
+					return _json_response({"error": "当前没有评分通过且待生成招呼语的岗位"}, 400)
+			durable_run_id = str(uuid4())
+			extra = {
+				"_workbench_job_ids": job_ids,
+				"_greeting_run_id": durable_run_id,
+				"_greeting_scope": greeting_scope,
+			}
+		elif mode == "score":
+			active_scoring_runs = [
+				run for run in list_scoring_runs(DATA_DIR / "bosshunter.db", limit=100)
+				if run.get("status") in {"running", "paused"}
+			]
+			if active_scoring_runs:
+				return _json_response({"error": "已有独立评分任务正在运行或等待恢复，请先继续或结束该任务"}, 409)
+			try:
+				score_options = _scoring_options_from_body(body)
+			except ValueError as exc:
+				return _json_response({"error": str(exc)}, 400)
+			validation_db = _get_web_db()
+			try:
+				selected = select_scoring_jobs(validation_db, **score_options)
+			finally:
+				validation_db.close()
+			if not selected:
+				return _json_response({"error": "没有符合条件的待评分岗位"}, 400)
+			durable_run_id = str(uuid4())
+			extra = {
+				"_score_run_id": durable_run_id,
+				"_score_options": {
+					# Freeze the selected snapshot so a long-running task does not
+					# unexpectedly consume jobs added after it started.
+					"scope": "selected",
+					"limit": None,
+					"job_ids": [str(job["id"]) for job in selected],
+					"force_rescore": score_options["force_rescore"],
+				},
+			}
 		messages = _preflight_messages(mode, base_config, collection_options)
 		if messages:
 			return _json_response({"error": "请先处理启动前检查", "messages": messages}, 400)
-		extra = {"_collection_options": collection_options} if collection_options is not None else {}
+		if collection_options is not None:
+			extra = {"_collection_options": collection_options}
 		if collection_options is not None:
 			# Persist only non-secret collection preferences so the next dialog can
 			# restore each platform's independent fields and queue order.
@@ -1396,6 +2047,15 @@ def api_workbench_task_start():
 				"auto_score_default": collection_options["auto_score"],
 				"execution_mode": collection_options.get("execution_mode", "safe_serial"),
 			}
+			# Choosing the experimental mode is an explicit user opt-in. Keep the
+			# server guard in place for direct API/config callers, while allowing the
+			# collection dialog to enable it without a manual YAML edit.
+			if collection_options.get("execution_mode") == "parallel_pilot":
+				base_config["collection"]["parallel_pilot_enabled"] = True
+			if collection_options.get("execution_mode") == "parallel_boss_zhilian":
+				base_config["collection"]["parallel_boss_zhilian_enabled"] = True
+			if collection_options.get("execution_mode") == "parallel_all_platforms":
+				base_config["collection"]["parallel_all_platforms_enabled"] = True
 			platform_configs = deepcopy(base_config.get("platforms")) if isinstance(base_config.get("platforms"), dict) else {}
 			selected_platforms = set(collection_options["platform_order"])
 			for platform, value in collection_options["platforms"].items():
@@ -1410,7 +2070,40 @@ def api_workbench_task_start():
 			base_config["platforms"] = platform_configs
 			_write_config(base_config)
 		with job_mutation_lock:
-			task = task_runner.start(mode, _task_config(extra))
+			if mode == "score":
+				selected_ids = list(extra.get("_score_options", {}).get("job_ids", []))
+				create_scoring_run(
+					DATA_DIR / "bosshunter.db",
+					run_id=durable_run_id,
+					options={
+						"scope": "selected",
+						"limit": None,
+						"force_rescore": bool(extra.get("_score_options", {}).get("force_rescore")),
+					},
+					job_ids=selected_ids,
+				)
+				update_scoring_run(DATA_DIR / "bosshunter.db", durable_run_id, status="running")
+			elif mode == "greet":
+				selected_ids = list(extra.get("_workbench_job_ids", []))
+				create_greeting_run(
+					DATA_DIR / "bosshunter.db",
+					run_id=durable_run_id,
+					options={"job_ids": selected_ids},
+					job_ids=selected_ids,
+				)
+				update_greeting_run(DATA_DIR / "bosshunter.db", durable_run_id, status="running")
+			try:
+				task = task_runner.start(mode, _task_config(extra))
+			except Exception:
+				if mode == "score" and durable_run_id:
+					update_scoring_run(DATA_DIR / "bosshunter.db", durable_run_id, status="stopped", remaining_job_ids=[])
+				elif mode == "greet" and durable_run_id:
+					update_greeting_run(DATA_DIR / "bosshunter.db", durable_run_id, status="stopped", remaining_job_ids=[])
+				raise
+			if mode == "score":
+				update_scoring_run(DATA_DIR / "bosshunter.db", durable_run_id, task_id=str(task.get("id") or ""))
+			elif mode == "greet":
+				update_greeting_run(DATA_DIR / "bosshunter.db", durable_run_id, task_id=str(task.get("id") or ""))
 		return _json_response(task)
 	except TaskAlreadyRunningError as e:
 		return _json_response({"error": str(e)}, 409)
@@ -1438,7 +2131,22 @@ def api_collection_run_detail(run_id):
 @app.route("/api/workbench/task/<task_id>/stop", method="POST")
 def api_workbench_task_stop(task_id):
 	try:
-		return _json_response(task_runner.stop(task_id))
+		task = task_runner.stop(task_id)
+		# Keep the durable scoring run in lockstep with the in-memory task. A
+		# process restart or a generic stop used to leave its job references in
+		# ``running/paused``, blocking pool cleanup with no visible task.
+		run_id = str(task.get("checkpoint", {}).get("run_id") or "")
+		if not run_id:
+			stored_task = task_runner._tasks.get(task_id)
+			if stored_task is not None:
+				run_id = str(stored_task.context.get("checkpoint", {}).get("run_id") or "")
+		if run_id:
+			db_path = DATA_DIR / "bosshunter.db"
+			if get_scoring_run(db_path, run_id):
+				update_scoring_run(db_path, run_id, status="stopped", remaining_job_ids=[])
+			elif get_greeting_run(db_path, run_id):
+				update_greeting_run(db_path, run_id, status="stopped", remaining_job_ids=[])
+		return _json_response(task)
 	except KeyError:
 		return _json_response({"error": "任务不存在"}, 404)
 	except Exception as e:
@@ -1448,7 +2156,18 @@ def api_workbench_task_stop(task_id):
 @app.route("/api/workbench/task/<task_id>/pause", method="POST")
 def api_workbench_task_pause(task_id):
 	try:
-		return _json_response(task_runner.pause(task_id))
+		task = task_runner.pause(task_id)
+		run_id = str(task.get("checkpoint", {}).get("run_id") or "")
+		stored_task = task_runner._tasks.get(task_id)
+		if not run_id and stored_task is not None:
+			run_id = str(stored_task.context.get("checkpoint", {}).get("run_id") or "")
+		if run_id:
+			db_path = DATA_DIR / "bosshunter.db"
+			if get_scoring_run(db_path, run_id):
+				update_scoring_run(db_path, run_id, status="paused", pause_reason="用户暂停任务")
+			elif get_greeting_run(db_path, run_id):
+				update_greeting_run(db_path, run_id, status="paused", pause_reason="用户暂停任务")
+		return _json_response(task)
 	except KeyError:
 		return _json_response({"error": "任务不存在"}, 404)
 	except Exception as e:
@@ -1490,6 +2209,12 @@ def api_workbench_task_resume(task_id):
 				config.setdefault("collection", {})["default_order"] = collection_options["platform_order"]
 				config.setdefault("collection", {})["auto_score_default"] = collection_options["auto_score"]
 				config.setdefault("collection", {})["execution_mode"] = collection_options.get("execution_mode", "safe_serial")
+				if collection_options.get("execution_mode") == "parallel_pilot":
+					config.setdefault("collection", {})["parallel_pilot_enabled"] = True
+				if collection_options.get("execution_mode") == "parallel_boss_zhilian":
+					config.setdefault("collection", {})["parallel_boss_zhilian_enabled"] = True
+				if collection_options.get("execution_mode") == "parallel_all_platforms":
+					config.setdefault("collection", {})["parallel_all_platforms_enabled"] = True
 				platform_configs = deepcopy(config.get("platforms")) if isinstance(config.get("platforms"), dict) else {}
 				selected_platforms = set(collection_options["platform_order"])
 				for platform, value in collection_options["platforms"].items():
@@ -1510,6 +2235,37 @@ def api_workbench_task_resume(task_id):
 		return _json_response({"error": "任务不存在"}, 404)
 	except Exception as e:
 		return _json_response({"error": str(e)}, 500)
+
+
+@app.route("/api/workbench/task/<task_id>/retry", method="POST")
+def api_workbench_task_retry(task_id):
+	"""Retry an independently failed task from its last durable boundary."""
+	try:
+		stored_task = task_runner._tasks.get(task_id)
+		if stored_task is None:
+			return _json_response({"error": "任务不存在"}, 404)
+		config = load_config(CONFIG_PATH)
+		previous = stored_task.context.get("resume_config")
+		if isinstance(previous, dict):
+			for key, value in previous.items():
+				if str(key).startswith("_") and key not in {"_workbench_stop_event", "_workbench_pause_event"}:
+					config[key] = value
+		run_id = str(stored_task.context.get("checkpoint", {}).get("run_id") or "")
+		db_path = DATA_DIR / "bosshunter.db"
+		if run_id:
+			if get_scoring_run(db_path, run_id):
+				update_scoring_run(db_path, run_id, status="running", allow_reopen=True)
+			elif get_greeting_run(db_path, run_id):
+				update_greeting_run(db_path, run_id, status="running", allow_reopen=True)
+		return _json_response(task_runner.retry(task_id, config))
+	except TaskAlreadyRunningError as exc:
+		return _json_response({"error": str(exc)}, 409)
+	except ValueError as exc:
+		return _json_response({"error": str(exc)}, 409)
+	except KeyError:
+		return _json_response({"error": "任务不存在"}, 404)
+	except Exception as exc:
+		return _json_response({"error": str(exc)}, 500)
 
 
 @app.route("/api/workbench/deliver", method="POST")
@@ -1564,38 +2320,45 @@ def api_workbench_deliver():
 			}, 409)
 
 		status = task_runner.status()
+		active_tasks = status.get("active_tasks") or ([] if not status.get("active") else [status["active"]])
 		active_task = status.get("active") or {}
-		active_runtime_task = task_runner._tasks.get(active_task.get("id"))
+		active_runtime_tasks = [
+			task_runner._tasks.get(item.get("id"))
+			for item in active_tasks
+			if isinstance(item, dict) and task_runner._tasks.get(item.get("id")) is not None
+		]
 		monitoring_task = None
-		if (
-			active_runtime_task
-			and active_runtime_task.status == "running"
-			and active_runtime_task.context.get("monitoring")
-		):
-			monitoring_task = active_runtime_task
+		for candidate in active_runtime_tasks:
+			if candidate.status == "running" and candidate.context.get("monitoring"):
+				monitoring_task = candidate
+				break
 		delivery_task = None
-		if (
-			active_runtime_task
-			and active_runtime_task.status == "running"
-			and active_runtime_task.context.get("delivering")
-		):
-			delivery_task = active_runtime_task
+		for candidate in active_runtime_tasks:
+			if candidate.status == "running" and candidate.context.get("delivering"):
+				delivery_task = candidate
+				break
 		waiting_task = None
-		if (
-			not direct_send
-			and active_runtime_task
-			and active_runtime_task.mode == "full"
-			and active_runtime_task.status == "running"
-			and not monitoring_task
-			and not delivery_task
-			and not active_runtime_task.context.get("confirmation_complete")
-		):
-			waiting_task = active_runtime_task
-		if active_task and not waiting_task and not monitoring_task and not delivery_task:
-			raise TaskAlreadyRunningError(
-				f"当前已有后台任务「{active_task.get('label', '未知任务')}」正在运行或停止中，请等待其完全结束"
+		if not direct_send:
+			for candidate in active_runtime_tasks:
+				if (
+					candidate.mode == "full"
+					and candidate.status == "running"
+					and not candidate.context.get("monitoring")
+					and not candidate.context.get("delivering")
+					and not candidate.context.get("confirmation_complete")
+				):
+					waiting_task = candidate
+					break
+		if not waiting_task and not monitoring_task and not delivery_task:
+			conflicts = task_runner.conflicts(
+				"deliver",
+				{"_workbench_skip_greeting": direct_send},
 			)
-
+			if conflicts:
+				labels = "、".join(f"「{item.get('label', '未知任务')}」" for item in conflicts[:3])
+				raise TaskAlreadyRunningError(
+					f"当前投递与后台任务{labels}存在资源冲突，请等待其完全结束"
+				)
 		queued_payload = None
 		status_job_ids = job_ids
 		if delivery_task:
@@ -1994,13 +2757,19 @@ def _job_action_error(exc: ValueError):
 
 
 def _active_task_mutation_error():
-	active = task_runner.status().get("active")
-	if not active:
+	status = task_runner.status()
+	active_tasks = status.get("active_tasks") or ([] if not status.get("active") else [status["active"]])
+	if not active_tasks:
 		return None
+	active = active_tasks[0]
+	labels = "、".join(f"「{item.get('label', '未知任务')}」" for item in active_tasks[:3])
+	if len(active_tasks) > 3:
+		labels += f" 等 {len(active_tasks)} 个任务"
 	return _json_response({
-		"error": f"当前后台任务「{active.get('label', '未知任务')}」仍在运行，请停止或等待结束后再修改岗位状态",
+		"error": f"当前后台任务{labels}仍在运行，请停止或等待结束后再修改岗位状态",
 		"code": "active_task_conflict",
 		"task_id": active.get("id"),
+		"task_ids": [item.get("id") for item in active_tasks if item.get("id")],
 	}, 409)
 
 

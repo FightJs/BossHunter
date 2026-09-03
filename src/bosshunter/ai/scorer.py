@@ -3,6 +3,7 @@
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 import json
+import time
 from pathlib import Path
 
 from rich.console import Console
@@ -24,6 +25,12 @@ from bosshunter.ai.prefilter import quick_score
 from bosshunter.scoring_selection import select_scoring_jobs, validate_options
 
 console = Console()
+
+
+def _open_db(config: dict):
+    """Open the runtime database when a web task supplies an explicit path."""
+    db_path = config.get("_workbench_db_path") if isinstance(config, dict) else None
+    return get_db(Path(str(db_path))) if db_path else get_db()
 
 def get_scoring_concurrency(config: dict) -> int:
     """Return a bounded, user-configurable AI scoring worker count."""
@@ -346,6 +353,7 @@ def _report_progress(
     scored: int,
     filtered: int,
     failed: int,
+    active_jobs: list[dict[str, str]] | None = None,
 ) -> None:
     callback = config.get("_workbench_score_progress")
     if callable(callback):
@@ -355,6 +363,7 @@ def _report_progress(
             "scored": scored,
             "filtered": filtered,
             "failed": failed,
+            "active_jobs": list(active_jobs or []),
         })
 
 
@@ -390,40 +399,58 @@ def _request_score(
     """Request and validate one primary assessment without touching the database."""
     ai_cfg = config.get("ai", {}) if isinstance(config.get("ai"), dict) else {}
     response: str | None = None
-    try:
-        response = _call_claude(_build_scoring_prompt(job, resume, config), config)
-    except AIRequestError as exc:
-        if exc.kind == "output_truncated":
-            _notify(config, f"{job['company']}｜{job['title']} 的评分回答被截断，正在增大输出 Token 上限后重试。")
-            try:
-                configured_tokens = int(ai_cfg.get("scoring_max_tokens", 8192) or 8192)
-            except (TypeError, ValueError):
-                configured_tokens = 8192
-            retry_tokens = min(max(configured_tokens * 2, 512), 65536)
-            try:
-                response = _call_claude(_build_scoring_prompt(job, resume, config), config, retry_tokens)
-            except AIRequestError as retry_exc:
-                if retry_exc.kind in {"output_truncated", "output_limit", "context_limit"}:
-                    return ScoreOutcome(failure_detail="调整输出 Token 后仍未获得完整评分")
-                return ScoreOutcome(pause_reason=retry_exc.user_message)
-        elif exc.kind == "output_limit":
-            _notify(config, f"{job['company']}｜{job['title']} 正在降低输出 Token 上限后重试评分。")
-            try:
-                response = _call_claude(_build_scoring_prompt(job, resume, config), config, 128)
-            except AIRequestError as retry_exc:
-                if retry_exc.kind == "output_limit":
-                    return ScoreOutcome(failure_detail="当前模型不接受调整后的输出 Token 设置")
-                return ScoreOutcome(pause_reason=retry_exc.user_message)
-        elif exc.kind == "context_limit":
-            _notify(config, f"{job['company']}｜{job['title']} 内容较长，正在压缩后重试评分。")
-            try:
-                response = _call_claude(_build_scoring_prompt(job, resume, config, compact=True), config, 128)
-            except AIRequestError as retry_exc:
-                if retry_exc.kind == "context_limit":
-                    return ScoreOutcome(failure_detail="压缩请求后仍超过模型上下文限制")
-                return ScoreOutcome(pause_reason=retry_exc.user_message)
-        else:
-            return ScoreOutcome(pause_reason=exc.user_message)
+    prompt = _build_scoring_prompt(job, resume, config)
+    request_attempt = 0
+    while True:
+        request_attempt += 1
+        try:
+            response = _call_claude(prompt, config)
+            break
+        except AIRequestError as exc:
+            # Transient transport/provider failures should be retried before
+            # pausing the whole run. Credentials and quota errors are not
+            # transient and remain immediately actionable.
+            if exc.kind in {"network", "request_failed", "rate_limit"} and request_attempt < max_attempts:
+                delay = min(2 ** (request_attempt - 1), 8)
+                _notify(config, f"{job['company']}｜{job['title']} AI 请求失败，{delay} 秒后重试（{request_attempt + 1}/{max_attempts}）。")
+                time.sleep(delay)
+                continue
+            if exc.kind in {"network", "request_failed", "rate_limit"}:
+                return ScoreOutcome(pause_reason=f"{exc.user_message}（已重试 {request_attempt} 次）")
+            if exc.kind == "output_truncated":
+                _notify(config, f"{job['company']}｜{job['title']} 的评分回答被截断，正在增大输出 Token 上限后重试。")
+                try:
+                    configured_tokens = int(ai_cfg.get("scoring_max_tokens", 8192) or 8192)
+                except (TypeError, ValueError):
+                    configured_tokens = 8192
+                retry_tokens = min(max(configured_tokens * 2, 512), 65536)
+                try:
+                    response = _call_claude(_build_scoring_prompt(job, resume, config), config, retry_tokens)
+                except AIRequestError as retry_exc:
+                    if retry_exc.kind in {"output_truncated", "output_limit", "context_limit"}:
+                        return ScoreOutcome(failure_detail="调整输出 Token 后仍未获得完整评分")
+                    return ScoreOutcome(pause_reason=retry_exc.user_message)
+            elif exc.kind == "output_limit":
+                _notify(config, f"{job['company']}｜{job['title']} 正在降低输出 Token 上限后重试评分。")
+                try:
+                    response = _call_claude(_build_scoring_prompt(job, resume, config), config, 128)
+                except AIRequestError as retry_exc:
+                    if retry_exc.kind == "output_limit":
+                        return ScoreOutcome(failure_detail="当前模型不接受调整后的输出 Token 设置")
+                    return ScoreOutcome(pause_reason=retry_exc.user_message)
+            elif exc.kind == "context_limit":
+                _notify(config, f"{job['company']}｜{job['title']} 内容较长，正在压缩后重试评分。")
+                try:
+                    response = _call_claude(_build_scoring_prompt(job, resume, config, compact=True), config, 128)
+                except AIRequestError as retry_exc:
+                    if retry_exc.kind == "context_limit":
+                        return ScoreOutcome(failure_detail="压缩请求后仍超过模型上下文限制")
+                    return ScoreOutcome(pause_reason=retry_exc.user_message)
+            else:
+                return ScoreOutcome(pause_reason=exc.user_message)
+            # The specialized retry above produced the response to validate;
+            # do not issue the normal request a second time.
+            break
 
     result = _validated_score_result(response) if response else None
     for attempt in range(2, max_attempts + 1):
@@ -488,7 +515,7 @@ def score_jobs(
     rescore_filtered: bool = False,
 ) -> tuple[int, int]:
     """Score every unscored pending job; previously scored jobs keep their result."""
-    db = get_db()
+    db = _open_db(config)
     try:
         resume = _load_resume(config)
         if not resume:
@@ -531,6 +558,7 @@ def score_jobs(
         processed = 0
         failed = 0
         pause_reason = ""
+        pause_event = config.get("_workbench_pause_event")
 
         with Progress(
             SpinnerColumn(),
@@ -571,6 +599,16 @@ def score_jobs(
             futures: dict[Future[ScoreOutcome], dict] = {}
             job_iter = iter(ai_jobs)
 
+            def active_job_snapshot() -> list[dict[str, str]]:
+                return [
+                    {
+                        "id": str(job.get("id") or ""),
+                        "company": str(job.get("company") or "未知公司"),
+                        "title": str(job.get("title") or "未知岗位"),
+                    }
+                    for job in futures.values()
+                ]
+
             def submit_next() -> bool:
                 try:
                     next_job = next(job_iter)
@@ -578,6 +616,7 @@ def score_jobs(
                     return False
                 future = executor.submit(_score_job_with_ai, next_job, resume, config, max_attempts)
                 futures[future] = next_job
+                _report_progress(config, processed, len(pending_jobs), scored, filtered, failed, active_job_snapshot())
                 return True
 
             for _ in range(min(concurrency, len(ai_jobs))):
@@ -626,13 +665,14 @@ def score_jobs(
                             advance=1,
                             description=f"评分中 ({processed}/{len(pending_jobs)}) [预筛淘汰{prefiltered}]",
                         )
-                        _report_progress(config, processed, len(pending_jobs), scored, filtered, failed)
+                        _report_progress(config, processed, len(pending_jobs), scored, filtered, failed, active_job_snapshot())
 
                     if outcome.pause_reason:
                         pause_reason = outcome.pause_reason
                         interrupted = True
                         break
                     submit_next()
+                    _report_progress(config, processed, len(pending_jobs), scored, filtered, failed, active_job_snapshot())
                 if interrupted:
                     break
 
@@ -653,13 +693,20 @@ def score_jobs(
             )
         if failed:
             _notify(config, f"本轮有 {failed} 个岗位评分失败并保留为待处理，可稍后重试。")
-        if remaining_job_ids:
+        # A user stop is terminal for an independent run; only an explicit
+        # pause request or a recoverable AI pause should keep the run resumable.
+        is_paused = bool(pause_reason) or (
+            pause_event is not None and callable(getattr(pause_event, "is_set", None)) and pause_event.is_set()
+        )
+        if remaining_job_ids and is_paused:
             _report_checkpoint(
                 config,
                 remaining_job_ids,
                 status="paused",
                 pause_reason=pause_reason or "用户暂停或任务中断",
             )
+        elif remaining_job_ids:
+            _report_checkpoint(config, [], status="stopped")
         else:
             _report_checkpoint(
                 config,

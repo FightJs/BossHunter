@@ -1729,12 +1729,16 @@ def _generate_follow_up(job: dict, config: dict) -> str | None:
     return _call_claude(prompt, config)
 
 
-def monitor_and_send_resumes(config: dict) -> dict:
+def monitor_and_send_resumes(config: dict, *, allow_outside_send_window: bool = False) -> dict:
     """Full monitoring cycle:
     1. Detect HR replies
     2. For each reply: check if user already replied → skip or auto-handle
     3. If HR asks resume → optimize + send PDF + send portfolio link
     4. If HR just replied → generate natural reply
+
+    HR-triggered handling is always allowed when
+    ``allow_outside_send_window`` is set; proactive follow-up messages remain
+    inside the configured send window.
 
     Returns summary dict with counts.
     """
@@ -1743,11 +1747,15 @@ def monitor_and_send_resumes(config: dict) -> dict:
     if stop_event and stop_event.is_set():
         return {"skipped": 0, "replied": 0, "needs_resume": 0, "rejected": 0, "failed": 0}
 
-    # Time window check (09:00-16:00)
+    # Proactive monitor sends stay inside the window; HR-triggered handling
+    # is allowed whenever allow_outside_send_window is enabled.
     window_checker = SendWindowChecker(throttle_config.get("send_windows", ["09:00-16:00"]))
-    if not window_checker.is_active():
-        console.print("[yellow]当前不在工作时间窗口内 (09:00-16:00)[/yellow]")
+    send_window_active = window_checker.is_active()
+    if not send_window_active and not allow_outside_send_window:
+        console.print("[yellow]当前不在发送时间窗口内，暂不监测[/yellow]")
         return {"skipped": 0, "replied": 0, "needs_resume": 0, "rejected": 0, "failed": 0}
+    if not send_window_active and allow_outside_send_window:
+        console.print("[yellow]当前不在发送时间窗口内，继续处理 HR 回复与简历请求[/yellow]")
 
     operation_multiplier = get_boss_operation_interval_multiplier(config)
     throttle = RequestThrottle(
@@ -1828,6 +1836,9 @@ def monitor_and_send_resumes(config: dict) -> dict:
     # Step 3: Follow up ONLY on jobs with absolutely no HR reply
     # Pass replied_job_ids so follow-up skips any job touched this cycle
     if (stop_event and stop_event.is_set()) or summary.get("stop_reason"):
+        return summary
+    if not send_window_active:
+        console.print("[dim]当前不在发送时间窗口内，自动跟进留到窗口内执行[/dim]")
         return summary
     console.print("\n[bold cyan]═══ 第二步：跟进无回复岗位 ═══[/bold cyan]")
     try:

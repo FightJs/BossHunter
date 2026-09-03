@@ -18,6 +18,23 @@ class WebConfigApiTests(unittest.TestCase):
 		self.assertEqual(redacted["ai"]["api_key_masked"], "test***5678")
 		self.assertEqual(config["ai"]["api_key"], "test-api-key-12345678")
 
+	def test_redacted_config_masks_every_saved_ai_profile(self):
+		config = {
+			"ai": {
+				"profiles": [
+					{"id": "primary", "api_key": "primary-secret-12345678"},
+					{"id": "backup", "api_key": "backup-secret-12345678"},
+				]
+			}
+		}
+
+		redacted = server._redact_config_for_response(config)
+
+		for profile in redacted["ai"]["profiles"]:
+			self.assertNotIn("api_key", profile)
+			self.assertIn("api_key_masked", profile)
+		self.assertEqual(config["ai"]["profiles"][0]["api_key"], "primary-secret-12345678")
+
 	def test_config_download_payload_does_not_include_raw_credentials(self):
 		payload = server._config_download_payload({
 			"ai": {
@@ -29,6 +46,21 @@ class WebConfigApiTests(unittest.TestCase):
 
 		self.assertNotIn("test-api-key-12345678", payload)
 		self.assertNotIn("auth-token-12345678", payload)
+		self.assertNotIn("api_key_masked", payload)
+		self.assertNotIn("auth_token_masked", payload)
+
+	def test_config_download_payload_strips_profile_credentials(self):
+		payload = server._config_download_payload({
+			"ai": {
+				"profiles": [
+					{"id": "primary", "api_key": "primary-secret-12345678"},
+					{"id": "backup", "auth_token": "backup-token-12345678"},
+				]
+			}
+		})
+
+		self.assertNotIn("primary-secret-12345678", payload)
+		self.assertNotIn("backup-token-12345678", payload)
 		self.assertNotIn("api_key_masked", payload)
 		self.assertNotIn("auth_token_masked", payload)
 
@@ -194,6 +226,42 @@ class WebConfigApiTests(unittest.TestCase):
 
 		self.assertEqual(cleaned["ai"]["api_key"], "new-deepseek-secret")
 		self.assertNotIn("auth_token", cleaned["ai"])
+
+	def test_sanitize_config_preserves_each_profile_key_and_syncs_active_profile(self):
+		with tempfile.TemporaryDirectory() as tmp:
+			config_path = Path(tmp) / "config.yaml"
+			config_path.write_text(
+				yaml.dump(
+					{
+						"ai": {
+							"active_profile_id": "primary",
+							"profiles": [
+								{"id": "primary", "name": "主账号", "service": "anthropic", "api_key": "primary-secret"},
+								{"id": "backup", "name": "备用账号", "service": "deepseek", "api_key": "backup-secret"},
+							],
+						}
+					},
+					sort_keys=False,
+				),
+				encoding="utf-8",
+			)
+
+			with patch.object(server, "CONFIG_PATH", config_path):
+				cleaned = server._sanitize_config_for_write({
+					"ai": {
+						"active_profile_id": "backup",
+						"profiles": [
+							{"id": "primary", "name": "主账号", "service": "anthropic", "api_key": ""},
+							{"id": "backup", "name": "备用账号", "service": "deepseek", "api_key": ""},
+						],
+					}
+				})
+
+		profiles = {profile["id"]: profile for profile in cleaned["ai"]["profiles"]}
+		self.assertEqual(profiles["primary"]["api_key"], "primary-secret")
+		self.assertEqual(profiles["backup"]["api_key"], "backup-secret")
+		self.assertEqual(cleaned["ai"]["api_key"], "backup-secret")
+		self.assertEqual(cleaned["ai"]["service"], "deepseek")
 
 	def test_redacted_config_does_not_return_raw_auth_token(self):
 		config = {"ai": {"auth_token": "auth-token-12345678", "model": "claude"}}

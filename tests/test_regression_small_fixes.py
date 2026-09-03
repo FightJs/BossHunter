@@ -87,6 +87,17 @@ class ConfigExampleTests(unittest.TestCase):
 
         self.assertNotIn("prefilter_threshold", config["scoring"])
 
+    def test_example_exposes_zhilian_and_job51_delay_settings(self):
+        config = yaml.safe_load((ROOT / "config.example.yaml").read_text(encoding="utf-8"))
+        collection = config["collection"]
+
+        self.assertEqual(collection["zhilian_detail_delay_min_seconds"], 8)
+        self.assertEqual(collection["zhilian_detail_delay_max_seconds"], 15)
+        self.assertEqual(collection["job51_page_delay_min_seconds"], 30)
+        self.assertEqual(collection["job51_page_delay_max_seconds"], 45)
+        self.assertEqual(collection["job51_detail_delay_min_seconds"], 12)
+        self.assertEqual(collection["job51_detail_delay_max_seconds"], 20)
+
 
 class ConfigValidationTests(unittest.TestCase):
     def test_load_config_rejects_unsupported_ai_provider(self):
@@ -597,6 +608,13 @@ class DashboardPageTests(unittest.TestCase):
         self.assertIn("放弃已失效岗位", self.source)
         self.assertIn("放弃全部", self.source)
 
+    def test_dashboard_retries_send_errors_with_direct_send_flow(self):
+        # Failed greetings already have their text generated. Retrying them
+        # must skip the confirmation/generation flow and re-enter delivery.
+        section = self.source[self.source.index("发送失败待处理"):]
+        self.assertIn("sendReadyGreetings(workbench.send_errors.map(job => job.id))", section)
+        self.assertNotIn("confirmDeliver(workbench.send_errors.map(job => job.id))", section)
+
     def test_monitor_pending_replies_can_be_dismissed(self):
         # Arrange: DashboardPage source is loaded in setUp.
 
@@ -757,6 +775,28 @@ class ConfigPageTests(unittest.TestCase):
         self.assertIn('label="BOSS 操作间隔倍率"', self.source)
         self.assertNotIn('label="BOSS 采集间隔倍数"', self.source)
 
+    def test_config_page_exposes_zhilian_and_job51_delay_settings(self):
+        for label in (
+            "智联招聘 详情间隔范围（秒）",
+            "51job 翻页间隔范围（秒）",
+            "51job 详情间隔范围（秒）",
+        ):
+            self.assertIn(f'label="{label}"', self.source)
+        self.assertIn("collection.zhilian_detail_delay_min_seconds", self.source)
+        self.assertIn("collection.zhilian_detail_delay_max_seconds", self.source)
+        self.assertIn("collection.job51_page_delay_min_seconds", self.source)
+        self.assertIn("collection.job51_page_delay_max_seconds", self.source)
+        self.assertIn("collection.job51_detail_delay_min_seconds", self.source)
+        self.assertIn("collection.job51_detail_delay_max_seconds", self.source)
+
+    def test_anti_monitor_platform_groups_are_collapsible(self):
+        self.assertIn("function CollapsibleGroup", self.source)
+        self.assertIn("toggleMonitorGroup", self.source)
+        self.assertIn('title="BOSS 直聘"', self.source)
+        self.assertIn('title="智联招聘"', self.source)
+        self.assertIn('title="51job"', self.source)
+        self.assertIn('title="发送节奏"', self.source)
+
     def test_random_delivery_cooldown_is_below_ai_settings(self):
         ai_index = self.source.index('title="AI 设置"')
         anti_monitor_index = self.source.index('title="反监测设置"')
@@ -774,6 +814,9 @@ class ConfigPageTests(unittest.TestCase):
             "期望薪资范围（K）",
             "BOSS 风险暂停范围（分钟）",
             "BOSS 采集后投递冷却范围（分钟）",
+            "智联招聘 详情间隔范围（秒）",
+            "51job 翻页间隔范围（秒）",
+            "51job 详情间隔范围（秒）",
             "发送间隔范围（秒）",
             "模拟浏览时长范围（秒）",
         ):
@@ -823,6 +866,24 @@ class ConfigSchemaTests(unittest.TestCase):
         self.assertEqual(enabled["label"], "启用自动跟进")
         self.assertEqual(enabled["type"], "switch")
         self.assertIs(enabled["default"], False)
+
+    def test_schema_exposes_zhilian_and_job51_delay_fields(self):
+        anti_monitor = next(
+            section
+            for section in self.schema["sections"]
+            if section.get("label") == "反监测设置"
+            and any(field["key"] == "daily_search_page_limit" for field in section["fields"])
+        )
+        keys = {field["key"] for field in anti_monitor["fields"]}
+
+        self.assertTrue({
+            "zhilian_detail_delay_min_seconds",
+            "zhilian_detail_delay_max_seconds",
+            "job51_page_delay_min_seconds",
+            "job51_page_delay_max_seconds",
+            "job51_detail_delay_min_seconds",
+            "job51_detail_delay_max_seconds",
+        }.issubset(keys))
 
 
 class ScorerPrefilterTests(unittest.TestCase):

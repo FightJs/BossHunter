@@ -61,6 +61,21 @@ AI_SERVICE_PRESETS: dict[str, dict[str, str]] = {
 }
 
 
+# These values describe one reusable AI connection. Runtime callers continue to
+# read the active connection from ``ai`` directly for backwards compatibility.
+AI_PROFILE_FIELDS = (
+    "service",
+    "provider",
+    "model",
+    "api_key",
+    "auth_token",
+    "base_url",
+    "thinking",
+    "thinking_budget",
+    "timeout_seconds",
+)
+
+
 DEFAULTS: dict[str, Any] = {
     "profile": {
         "resume_path": "./resume.md",
@@ -90,6 +105,8 @@ DEFAULTS: dict[str, Any] = {
         # A server-side guard for the experimental non-BOSS parallel scheduler.
         # It intentionally stays disabled in user configs until it is released.
         "parallel_pilot_enabled": False,
+        "parallel_boss_zhilian_enabled": False,
+        "parallel_all_platforms_enabled": False,
         "max_non_boss_workers": 2,
         "max_browser_targets": 3,
         "score_batch_size": 5,
@@ -100,6 +117,13 @@ DEFAULTS: dict[str, Any] = {
         "risk_pause_min_minutes": 5,
         "risk_pause_max_minutes": 10,
         "collection_delay_multiplier": 1.5,
+        # 智联与 51job 只做采集，不自动投递；这里只暴露各自的安全随机间隔。
+        "zhilian_detail_delay_min_seconds": 8.0,
+        "zhilian_detail_delay_max_seconds": 15.0,
+        "job51_page_delay_min_seconds": 30.0,
+        "job51_page_delay_max_seconds": 45.0,
+        "job51_detail_delay_min_seconds": 12.0,
+        "job51_detail_delay_max_seconds": 20.0,
         "delivery_cooldown_min_minutes": 5,
         "delivery_cooldown_max_minutes": 15,
     },
@@ -128,8 +152,28 @@ DEFAULTS: dict[str, Any] = {
             "enabled": False,
             "search": {
                 "keywords": [],
-                "cities": ["上海"],
-                "city_codes": {"上海": "020000"},
+                "cities": ["北京", "上海", "广州", "深圳", "成都", "重庆", "杭州", "武汉", "西安", "苏州", "南京", "天津", "郑州", "长沙", "东莞", "宁波", "青岛", "合肥", "佛山"],
+                "city_codes": {
+                    "北京": "010000",
+                    "上海": "020000",
+                    "广州": "030200",
+                    "深圳": "040000",
+                    "成都": "090200",
+                    "重庆": "060000",
+                    "杭州": "080200",
+                    "武汉": "180200",
+                    "西安": "200200",
+                    "苏州": "070300",
+                    "南京": "070200",
+                    "天津": "050000",
+                    "郑州": "170200",
+                    "长沙": "190200",
+                    "东莞": "030800",
+                    "宁波": "080300",
+                    "青岛": "120200",
+                    "合肥": "080100",
+                    "佛山": "030600",
+                },
                 "max_pages": 1,
                 "sort": "default",
             },
@@ -160,6 +204,7 @@ DEFAULTS: dict[str, Any] = {
         "scoring_max_attempts": 2,
         "scoring_concurrency": 2,
         "scoring_second_review": False,
+        "greeting_concurrency": 2,
         "greeting_max_tokens": 8192,
         "greeting_review_max_tokens": 4096,
         "greeting_max_attempts": 2,
@@ -220,7 +265,49 @@ def _normalize_config_sections(config: dict[str, Any]) -> dict[str, Any]:
         if isinstance(defaults, dict) and not isinstance(config.get(section), dict):
             config[section] = _deep_copy_dict(defaults)
 
+    _normalize_ai_profiles(config.get("ai", {}))
     return remove_retired_collection_settings(config)
+
+
+def _normalize_ai_profiles(ai_cfg: dict[str, Any]) -> None:
+    """Normalize saved AI connections and expose the selected one to callers.
+
+    ``ai.profiles`` is the source of truth for connection-specific values. The
+    selected profile is mirrored onto ``ai`` so existing scoring, greeting, and
+    diagnostics code can keep using the established flat configuration shape.
+    """
+    raw_profiles = ai_cfg.get("profiles")
+    profiles: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    if isinstance(raw_profiles, list):
+        for index, raw_profile in enumerate(raw_profiles):
+            if not isinstance(raw_profile, dict):
+                continue
+            profile_id = str(raw_profile.get("id") or "").strip() or f"profile-{index + 1}"
+            if profile_id in seen_ids:
+                profile_id = f"profile-{index + 1}"
+            seen_ids.add(profile_id)
+            profile = dict(raw_profile)
+            profile["id"] = profile_id
+            profile["name"] = str(profile.get("name") or f"AI 配置 {index + 1}").strip() or f"AI 配置 {index + 1}"
+            profiles.append(profile)
+
+    if not profiles:
+        legacy_profile = {field: ai_cfg[field] for field in AI_PROFILE_FIELDS if field in ai_cfg}
+        legacy_profile.update({"id": "default", "name": "默认 API"})
+        profiles = [legacy_profile]
+
+    active_profile_id = str(ai_cfg.get("active_profile_id") or "").strip()
+    active_profile = next((profile for profile in profiles if profile["id"] == active_profile_id), profiles[0])
+    ai_cfg["profiles"] = profiles
+    ai_cfg["active_profile_id"] = active_profile["id"]
+    for field in AI_PROFILE_FIELDS:
+        # Never retain a previous active connection's credential or endpoint
+        # when the newly selected profile intentionally leaves it blank.
+        ai_cfg.pop(field, None)
+        if field in active_profile:
+            ai_cfg[field] = active_profile[field]
 
 
 def remove_retired_collection_settings(config: dict[str, Any]) -> dict[str, Any]:
@@ -261,6 +348,18 @@ def _validate_ai_provider(config: dict[str, Any]) -> None:
     expected_provider = AI_SERVICE_PRESETS[service]["provider"]
     if provider != expected_provider:
         ai_cfg["provider"] = expected_provider
+
+    profiles = ai_cfg.get("profiles", [])
+    if not isinstance(profiles, list):
+        return
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        profile_service = str(profile.get("service") or service).strip()
+        if profile_service not in SUPPORTED_AI_SERVICES:
+            profile_service = "anthropic"
+        profile["service"] = profile_service
+        profile["provider"] = AI_SERVICE_PRESETS[profile_service]["provider"]
 
 
 def _deep_copy_dict(d: dict) -> dict:

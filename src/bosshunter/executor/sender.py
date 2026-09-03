@@ -2,6 +2,7 @@
 
 import time
 import json
+from pathlib import Path
 from threading import Event
 from urllib.parse import urljoin
 from rich.console import Console
@@ -27,6 +28,12 @@ from bosshunter.throttle import RequestThrottle, SendWindowChecker, ProgressiveB
 from bosshunter.platform_safety import PlatformAccessGuard, PlatformSafetyStop
 
 console = Console()
+
+
+def _open_db(config: dict):
+	"""Open the explicit web runtime database when provided."""
+	db_path = config.get("_workbench_db_path") if isinstance(config, dict) else None
+	return get_db(Path(str(db_path))) if db_path else get_db()
 
 CHAT_BUTTON_SELECTOR = (
     'a[redirect-url*="/web/geek/chat"], '
@@ -54,6 +61,17 @@ CHAT_BUTTON_SCRIPT_FOR_TESTS = """
     const candidates = selectors.flatMap((selector, priority) =>
         Array.from(document.querySelectorAll(selector)).map((el) => ({el, selector, priority}))
     );
+    // BOSS occasionally changes the class/ka attributes while keeping the
+    // visible action text. Include ordinary buttons/links as a compatibility
+    // fallback, then let the scoring below prefer the known selectors.
+    const known = new Set(candidates.map((item) => item.el));
+    Array.from(document.querySelectorAll('button, a, [role="button"]')).forEach((el) => {
+        const text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim();
+        const actionText = /^(立即|继续|马上|主动)?沟通(?:TA)?$|^(立即)?打招呼$|^发消息$/;
+        if (!known.has(el) && actionText.test(text)) {
+            candidates.push({el, selector: 'text-fallback', priority: 80});
+        }
+    });
     const elementState = (el) => {
         const rect = el.getBoundingClientRect();
         const style = getComputedStyle(el);
@@ -395,14 +413,48 @@ def _chat_target_matches_job(target_id: str, job: dict) -> bool:
         const activeText = normalize(
             activeRoots.map((element) => element.innerText || element.textContent || '').join(' ')
         );
-        const activeHtml = activeRoots.map((element) => element.outerHTML || '').join(' ');
+        const activeHtml = normalize(
+            activeRoots.map((element) => element.outerHTML || '').join(' ')
+        );
+        // BOSS mounts the conversation as a Vue SPA and removes the query
+        // string from location.href. The job id remains authoritative in
+        // $route.query.jobId, so inspect the route before falling back to
+        // the rendered conversation identity.
+        const routeJobIds = Array.from(new Set(
+            Array.from(document.querySelectorAll('.has-header, .main-wrap, .chat-user, .chat-conversation'))
+                .map((element) => element.__vue__ && element.__vue__.$route
+                    && element.__vue__.$route.query && element.__vue__.$route.query.jobId)
+                .filter(Boolean)
+                .map((value) => normalize(value))
+        ));
+        const routeIdMatch = !!expectedId && routeJobIds.includes(expectedId);
+        const currentUrl = normalize(location.href);
         const idMatch = !!expectedId && (
-            location.href.includes(expectedId) ||
-            activeHtml.includes(expectedId)
+            currentUrl.includes(expectedId) ||
+            activeHtml.includes(expectedId) ||
+            routeIdMatch
         );
         const identityMatch = !!expectedCompany && activeText.includes(expectedCompany) &&
             (!expectedTitle || activeText.includes(expectedTitle));
-        return JSON.stringify({{success: true, matches: idMatch || identityMatch}});
+        // Agency/代招 conversations may render the agency rather than the
+        // job's company. The active position card still carries the exact
+        // title; use it as a conservative fallback, never the whole sidebar.
+        const positionCard = document.querySelector(
+            '.chat-conversation .position-content[ka="geek_chat_job_detail"], '
+            + '.chat-conversation .position-content'
+        );
+        const positionText = normalize(positionCard && (
+            positionCard.innerText || positionCard.textContent || ''
+        ));
+        const positionTitleMatch = !!expectedTitle && !!positionCard &&
+            positionText.includes(expectedTitle);
+        // When BOSS exposes a route job id it is authoritative: do not let a
+        // same-titled position or agency name make us send to another chat.
+        const routeIsAuthoritative = !!expectedId && routeJobIds.length > 0;
+        const matches = routeIsAuthoritative
+            ? routeIdMatch
+            : (idMatch || identityMatch || positionTitleMatch);
+        return JSON.stringify({{success: true, matches}});
     }})()
     """))
     return bool(result.get("success") and result.get("matches"))
@@ -734,19 +786,49 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
         close_tab(target_id)
         return {"success": False, "error": "stopped", "history_detail": "用户已请求停止", "skip_backoff": True}, None
 
-    browse_min = throttle_config.get("browse_duration_min", 15)
-    browse_max = throttle_config.get("browse_duration_max", 30)
-    if throttle_config.get("browse_before_greet", True):
-        import random
-        browse_time = random.uniform(browse_min, browse_max)
-        if _sleep_or_stop(browse_time, stop_event):
-            close_tab(target_id)
-            return {"success": False, "error": "stopped", "history_detail": "用户已请求停止", "skip_backoff": True}, None
-
+    # Check the page state before the optional browse delay. BOSS's
+    # "page not found" screen redirects to the home page after a few seconds;
+    # waiting 15–30 seconds first would erase the only reliable evidence and
+    # turn a stale link into the misleading generic button error.
     page_check_js = """
     (() => {
         const text = document.body ? document.body.innerText : '';
         const title = document.title || '';
+        const pageState = `${title}\n${text}`;
+        const compactPageState = pageState.replace(/\\s+/g, '');
+        const hasLoginButton = Boolean(document.querySelector(
+            '.user-nav .header-login-btn, a.header-login-btn, '
+            + 'a[href*="/web/user/login"], a[ka*="header-login"]'
+        ));
+        const hasLoginWall = Boolean(document.querySelector(
+            '.job-detail-guide-immediate-login, .zp-more-info-layer, '
+            + '.zp-more-info-layer-wrapper, .login-layer'
+        ));
+        const hasLoginPrompt = /登录查看完整内容|点击登录，立即与BOSS沟通|首次验证通过即注册/
+            .test(compactPageState);
+        // BOSS keeps an unauthenticated job detail page clickable but routes the
+        // "立即沟通" action to sign-in instead of opening a chat. Fail clearly
+        // before clicking so the misleading "继续沟通跳转失败" is never recorded.
+        if (hasLoginButton || hasLoginWall || hasLoginPrompt) {
+            return JSON.stringify({
+                success: false,
+                error: 'boss_login_required',
+                history_detail: 'BOSS 直聘登录状态已失效，请先在已连接的 Chrome 中重新登录，再重新发送',
+                skip_backoff: true
+            });
+        }
+        // A stale job detail page is still a successful HTTP navigation, but
+        // BOSS removes the communication action and renders a clear status
+        // message. Detect it before looking for a button so retries do not
+        // report the misleading generic "无法找到沟通按钮" error.
+        if (/(?:职位|岗位)(?:已关闭|已下架|停止招聘|已停止招聘|招聘已结束|不再招聘)|(?:已关闭|已下架|停止招聘|已停止招聘|招聘已结束|不再招聘)(?:职位|岗位)/.test(compactPageState)) {
+            return JSON.stringify({
+                success: false,
+                error: 'job_closed',
+                history_detail: '岗位已关闭或下架，无法投递',
+                skip_backoff: true
+            });
+        }
         if (
             title.includes('访问的页面不存在') ||
             text.includes('您访问的页面不存在') ||
@@ -767,11 +849,29 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
         close_tab(target_id)
         return page_check, None
 
+    browse_min = throttle_config.get("browse_duration_min", 15)
+    browse_max = throttle_config.get("browse_duration_max", 30)
+    if throttle_config.get("browse_before_greet", True):
+        import random
+        browse_time = random.uniform(browse_min, browse_max)
+        if _sleep_or_stop(browse_time, stop_event):
+            close_tab(target_id)
+            return {"success": False, "error": "stopped", "history_detail": "用户已请求停止", "skip_backoff": True}, None
+
     chat_button_attempts = int(throttle_config.get("_chat_button_attempts", 30))
     result1a = _click_chat_button(target_id, stop_event, chat_button_attempts)
     if not result1a.get("success"):
         close_tab(target_id)
         return {"success": False, "error": "no_chat_button", "history_detail": "无法找到沟通按钮", "skip_backoff": True}, None
+
+    if str(result1a.get("ka") or "").startswith("go_chat_tosign"):
+        close_tab(target_id)
+        return {
+            "success": False,
+            "error": "boss_login_required",
+            "history_detail": "BOSS 直聘登录状态已失效，请先在已连接的 Chrome 中重新登录，再重新发送",
+            "skip_backoff": True,
+        }, None
 
     if _sleep_or_stop(4, stop_event):
         close_tab(target_id)
@@ -979,7 +1079,7 @@ def _send_greeting_once(job: dict, greeting: str, throttle_config: dict) -> tupl
 
 def send_greetings(config: dict, force: bool = False) -> int:
     """Send generated greetings. Returns count of successfully sent."""
-    db = get_db()
+    db = _open_db(config)
     throttle_config = dict(config.get("throttle", {}))
     stop_event = config.get("_workbench_stop_event")
     workbench_job_ids = {str(job_id) for job_id in config.get("_workbench_job_ids", [])}
@@ -1085,6 +1185,24 @@ def send_greetings(config: dict, force: bool = False) -> int:
     backoff = ProgressiveBackoff()
     sent_count = 0
 
+    def _emit_send_progress(current_job: dict | None = None, status: str = "running") -> None:
+        progress_callback = (
+            config.get("_workbench_send_progress")
+            or throttle_config.get("_workbench_send_progress")
+        )
+        if not callable(progress_callback):
+            return
+        progress_callback({
+            "total": len(jobs_to_send),
+            "attempted": send_report["attempted_count"],
+            "sent": sent_count,
+            "failed": send_report["failed_count"],
+            "deferred": max(int(send_report.get("quota_deferred_count") or 0), 0),
+            "current_job": current_job,
+            "status": status,
+        })
+
+    _emit_send_progress()
     console.print(f"[bold]准备发送 {len(jobs_to_send)} 条招呼语[/bold] (今日已发 {already_sent}/{daily_limit})")
 
     with Progress(
@@ -1107,6 +1225,7 @@ def send_greetings(config: dict, force: bool = False) -> int:
                 update_job_status(db, job["id"], "error")
                 send_report["attempted_count"] += 1
                 send_report["failed_count"] += 1
+                _emit_send_progress()
                 progress.update(task, advance=1)
                 continue
 
@@ -1119,6 +1238,11 @@ def send_greetings(config: dict, force: bool = False) -> int:
                     break
 
             progress.update(task, description=f"发送: {job['company'][:10]} - {job['title'][:15]}")
+            _emit_send_progress({
+                "id": str(job.get("id") or ""),
+                "company": str(job.get("company") or "未知公司"),
+                "title": str(job.get("title") or "未知岗位"),
+            })
 
             result_data, failed_target_id = _send_greeting_once(job, greeting, throttle_config)
             if result_data.get("error") == "stopped":
@@ -1149,14 +1273,18 @@ def send_greetings(config: dict, force: bool = False) -> int:
                 backoff.record_success()
             else:
                 error = result_data.get("error", "unknown")
-                if error in {"daily_platform_page_limit", "persistent_risk_lock"}:
+                if error in {"daily_platform_page_limit", "persistent_risk_lock", "boss_login_required"}:
                     send_report["stop_reason"] = error
-                    console.print("[yellow]为了账户安全，已达到平台页面访问上限或仍处于风险冷却，停止投递[/yellow]")
+                    if error == "boss_login_required":
+                        console.print("[yellow]BOSS 直聘登录状态已失效，请在 Chrome 中重新登录后重试，本轮投递已停止[/yellow]")
+                    else:
+                        console.print("[yellow]为了账户安全，已达到平台页面访问上限或仍处于风险冷却，停止投递[/yellow]")
                     break
                 send_report["failed_count"] += 1
                 update_job_status(db, job["id"], "error")
                 add_history(db, job["id"], "error", result_data.get("history_detail", f"发送失败: {error}"))
                 if result_data.get("skip_backoff"):
+                    _emit_send_progress()
                     progress.update(task, advance=1)
                     continue
 
@@ -1197,7 +1325,10 @@ def send_greetings(config: dict, force: bool = False) -> int:
                         send_report["stop_reason"] = "stopped"
                         break
 
+            _emit_send_progress()
             progress.update(task, advance=1)
+
+        _emit_send_progress()
 
     console.print(f"\n[green]✓ 成功发送 {sent_count} 条[/green]")
     report_total = len(workbench_job_ids) if workbench_job_ids else len(jobs)

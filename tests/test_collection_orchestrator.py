@@ -252,6 +252,65 @@ class CollectionOrchestratorTests(TestCase):
         self.assertEqual(result["execution"]["effective_mode"], "parallel_pilot")
         self.assertEqual(set(result["collected_job_ids"]), {"zhilian:zhilian-new", "51job:51job-new"})
 
+    def test_parallel_boss_zhilian_runs_the_two_platforms_concurrently_when_enabled(self):
+        barrier = Barrier(2)
+        started: list[str] = []
+
+        class ParallelCollector:
+            def __init__(self, platform: str):
+                self.platform = platform
+
+            def collect(self, _request, hooks: CollectorHooks):
+                started.append(self.platform)
+                barrier.wait(timeout=1)
+                candidate = _candidate(self.platform, f"{self.platform}-new")
+                if hooks.on_list_candidate(candidate):
+                    hooks.on_candidate(candidate)
+                return PlatformCollectionResult(self.platform, "completed", "search_exhausted", "完成")
+
+        registry = CollectorRegistry({
+            "boss": lambda: ParallelCollector("boss"),
+            "zhilian": lambda: ParallelCollector("zhilian"),
+        })
+        options = _options(order=["boss", "zhilian"])
+        options["execution_mode"] = "parallel_boss_zhilian"
+        config = {"collection": {"parallel_boss_zhilian_enabled": True, "max_browser_targets": 2}}
+        with tempfile.TemporaryDirectory() as tmp:
+            result = CollectionOrchestrator(config, db_path=Path(tmp) / "collection.db", registry=registry).run(options)
+
+        self.assertEqual(set(started), {"boss", "zhilian"})
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["execution"]["effective_mode"], "parallel_boss_zhilian")
+        self.assertEqual(set(result["collected_job_ids"]), {"boss-new", "zhilian:zhilian-new"})
+
+    def test_parallel_all_platforms_runs_three_platforms_concurrently_when_enabled(self):
+        barrier = Barrier(3)
+        started: list[str] = []
+
+        class ParallelCollector:
+            def __init__(self, platform: str):
+                self.platform = platform
+
+            def collect(self, _request, hooks: CollectorHooks):
+                started.append(self.platform)
+                barrier.wait(timeout=1)
+                candidate = _candidate(self.platform, f"{self.platform}-new")
+                if hooks.on_list_candidate(candidate):
+                    hooks.on_candidate(candidate)
+                return PlatformCollectionResult(self.platform, "completed", "search_exhausted", "完成")
+
+        registry = CollectorRegistry({platform: (lambda platform=platform: ParallelCollector(platform)) for platform in ("boss", "zhilian", "51job")})
+        options = _options(order=["boss", "zhilian", "51job"])
+        options["execution_mode"] = "parallel_all_platforms"
+        config = {"collection": {"parallel_all_platforms_enabled": True, "max_browser_targets": 3}}
+        with tempfile.TemporaryDirectory() as tmp:
+            result = CollectionOrchestrator(config, db_path=Path(tmp) / "collection.db", registry=registry).run(options)
+
+        self.assertEqual(set(started), {"boss", "zhilian", "51job"})
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["execution"]["effective_mode"], "parallel_all_platforms")
+        self.assertEqual(set(result["collected_job_ids"]), {"boss-new", "zhilian:zhilian-new", "51job:51job-new"})
+
     def test_pipelined_scoring_starts_while_the_next_platform_collects(self):
         score_started = Event()
 
@@ -302,7 +361,7 @@ class CollectionOrchestratorTests(TestCase):
         self.assertEqual(result["execution"]["effective_mode"], "safe_serial")
         self.assertTrue(result["execution"]["degraded"])
 
-    def test_parallel_pilot_preserves_a_blocked_platform_outcome(self):
+    def test_parallel_pilot_isolates_a_blocked_platform_outcome(self):
         barrier = Barrier(2)
 
         class BlockingCollector:
@@ -312,15 +371,17 @@ class CollectionOrchestratorTests(TestCase):
                 barrier.wait(timeout=1)
                 return PlatformCollectionResult("zhilian", "blocked", "rate_limit", "智联限流")
 
-        class CancelledCollector:
+        class CompletingCollector:
             platform = "51job"
 
             def collect(self, _request, hooks: CollectorHooks):
                 barrier.wait(timeout=1)
-                hooks.stop_event.wait(1)
-                return PlatformCollectionResult("51job", "stopped", "user_stopped", "同阶段已取消")
+                candidate = _candidate("51job", "still-runs")
+                if hooks.on_list_candidate(candidate):
+                    hooks.on_candidate(candidate)
+                return PlatformCollectionResult("51job", "completed", "search_exhausted", "完成")
 
-        registry = CollectorRegistry({"zhilian": BlockingCollector, "51job": CancelledCollector})
+        registry = CollectorRegistry({"zhilian": BlockingCollector, "51job": CompletingCollector})
         options = _options(order=["zhilian", "51job"])
         options["execution_mode"] = "parallel_pilot"
         with tempfile.TemporaryDirectory() as tmp:
@@ -332,3 +393,5 @@ class CollectionOrchestratorTests(TestCase):
 
         self.assertEqual(result["status"], "completed_with_errors")
         self.assertEqual(next(item for item in result["results"] if item["platform"] == "zhilian")["reason_code"], "rate_limit")
+        self.assertEqual(result["platforms"]["51job"]["status"], "completed")
+        self.assertEqual(result["collected_job_ids"], ["51job:still-runs"])

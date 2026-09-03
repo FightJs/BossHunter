@@ -75,7 +75,7 @@ progress_flush_ms: 500
 writer_drain_timeout_seconds: 30
 ```
 
-`parallel_pilot_enabled` 不在前端暴露。前端只能选择 `execution_mode`；当服务端开关关闭或请求不符合并行条件时，后端返回实际采用的 `safe_serial` 或 `pipelined` 模式及降级原因。
+`parallel_pilot_enabled` 和高风险的 `parallel_boss_zhilian_enabled` 可在配置页查看和控制；岗位采集窗口选择对应模式时也会视为一次明确的用户 opt-in，并自动保存该开关。服务端仍会校验并行条件；不满足时返回实际采用的 `safe_serial` 或 `pipelined` 模式及降级原因。
 
 ### 3.2 采集请求扩展
 

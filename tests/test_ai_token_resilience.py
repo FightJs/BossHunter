@@ -198,6 +198,7 @@ class ScorerTokenResilienceTests(unittest.TestCase):
         peak = 0
         main_thread = get_ident()
         write_threads: list[int] = []
+        progress_updates: list[dict] = []
 
         def call_ai(*_args, **_kwargs):
             nonlocal active, peak
@@ -223,13 +224,18 @@ class ScorerTokenResilienceTests(unittest.TestCase):
             patch("bosshunter.ai.scorer.update_job_status", side_effect=record_write),
         ):
             scored, filtered = scorer.score_jobs(
-                {"ai": {"scoring_concurrency": 3}, "scoring": {"threshold": 71}}
+                {
+                    "ai": {"scoring_concurrency": 3},
+                    "scoring": {"threshold": 71},
+                    "_workbench_score_progress": progress_updates.append,
+                }
             )
 
         self.assertEqual((scored, filtered), (5, 0))
         self.assertEqual(peak, 3)
         self.assertTrue(write_threads)
         self.assertEqual(set(write_threads), {main_thread})
+        self.assertTrue(any(len(update.get("active_jobs", [])) == 3 for update in progress_updates))
 
     def test_stop_returns_without_waiting_for_inflight_concurrent_ai_calls(self):
         db = MagicMock()

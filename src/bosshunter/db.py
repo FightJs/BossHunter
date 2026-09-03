@@ -122,6 +122,7 @@ def _init_tables(conn: sqlite3.Connection) -> None:
     _migrate_v1_4(conn)
     _migrate_platform_access_events(conn)
     _init_scoring_runs(conn)
+    _init_greeting_runs(conn)
     _init_collection_runs(conn)
 
 
@@ -256,6 +257,31 @@ def _scoring_run_conflicts(conn: sqlite3.Connection, job_ids: set[str]) -> list[
     return conflicts
 
 
+def _greeting_run_conflicts(conn: sqlite3.Connection, job_ids: set[str]) -> list[dict[str, Any]]:
+    """Protect jobs that a paused/running greeting batch still needs."""
+    conflicts: list[dict[str, Any]] = []
+    rows = conn.execute(
+        "SELECT id, status, remaining_job_ids_json FROM greeting_runs WHERE status IN ('running', 'paused')"
+    ).fetchall()
+    for row in rows:
+        try:
+            remaining = json.loads(row["remaining_job_ids_json"] or "[]")
+        except (TypeError, json.JSONDecodeError):
+            remaining = []
+        for job_id in sorted(job_ids & {str(value) for value in remaining if str(value)}):
+            conflicts.append({
+                "job_id": job_id,
+                "reasons": ["招呼语生成任务仍在运行或等待恢复"],
+                "greeting_run_id": str(row["id"]),
+                "run_status": str(row["status"]),
+            })
+    return conflicts
+
+
+def _recoverable_run_conflicts(conn: sqlite3.Connection, job_ids: set[str]) -> list[dict[str, Any]]:
+    return _scoring_run_conflicts(conn, job_ids) + _greeting_run_conflicts(conn, job_ids)
+
+
 def soft_delete_jobs(
     conn: sqlite3.Connection,
     job_ids: Any,
@@ -266,7 +292,7 @@ def soft_delete_jobs(
     if confirmed is not True:
         raise JobDeletionConfirmationError("移入回收站需要 confirmed=true")
     ids = _normalize_job_ids(job_ids, required=True)
-    run_conflicts = _scoring_run_conflicts(conn, set(ids))
+    run_conflicts = _recoverable_run_conflicts(conn, set(ids))
     if run_conflicts:
         raise JobDeletionConflictError("岗位仍被评分任务引用，请先结束该评分任务", blocked=run_conflicts)
     rows = _job_rows_by_ids(conn, ids)
@@ -382,7 +408,7 @@ def permanent_delete_jobs(
     if confirmed is not True or confirmation != "PERMANENT_DELETE":
         raise JobDeletionConfirmationError("永久删除需要 confirmed=true 和 confirmation=PERMANENT_DELETE")
     ids = _normalize_job_ids(job_ids, required=True)
-    run_conflicts = _scoring_run_conflicts(conn, set(ids))
+    run_conflicts = _recoverable_run_conflicts(conn, set(ids))
     if run_conflicts:
         raise JobDeletionConflictError("岗位仍被评分任务引用，请先结束该评分任务", blocked=run_conflicts)
     rows = _job_rows_by_ids(conn, ids)
@@ -444,7 +470,7 @@ def clear_active_jobs(
                     if row.get("deleted_at") is None
                 )
     job_ids = {str(row["id"]) for row in rows}
-    run_conflicts = _scoring_run_conflicts(conn, job_ids)
+    run_conflicts = _recoverable_run_conflicts(conn, job_ids)
     if run_conflicts:
         raise JobDeletionConflictError("岗位仍被评分任务引用，请先结束该评分任务", blocked=run_conflicts)
 
@@ -606,12 +632,20 @@ def get_jobs_ready_to_send(conn: sqlite3.Connection) -> list[dict]:
 def get_jobs_with_send_errors(conn: sqlite3.Connection) -> list[dict]:
     """Get jobs where greeting sending failed and can be retried."""
     rows = conn.execute("""
-        SELECT * FROM jobs
-        WHERE status = 'error'
-          AND deleted_at IS NULL
-          AND greeting IS NOT NULL
-          AND TRIM(greeting) != ''
-        ORDER BY updated_at DESC, score DESC
+        SELECT jobs.*,
+               (
+                   SELECT h.detail
+                   FROM history h
+                   WHERE h.job_id = jobs.id AND h.action = 'error'
+                   ORDER BY h.id DESC
+                   LIMIT 1
+               ) AS last_error
+        FROM jobs
+        WHERE jobs.status = 'error'
+          AND jobs.deleted_at IS NULL
+          AND jobs.greeting IS NOT NULL
+          AND TRIM(jobs.greeting) != ''
+        ORDER BY jobs.updated_at DESC, jobs.score DESC
     """).fetchall()
     return [dict(row) for row in rows]
 
@@ -739,6 +773,29 @@ def _init_scoring_runs(conn: sqlite3.Connection) -> None:
             finished_at TIMESTAMP NULL
         );
         CREATE INDEX IF NOT EXISTS idx_scoring_runs_status ON scoring_runs(status);
+        """
+    )
+    conn.commit()
+
+
+def _init_greeting_runs(conn: sqlite3.Connection) -> None:
+    """Create durable greeting-generation checkpoints on first use."""
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS greeting_runs (
+            id TEXT PRIMARY KEY,
+            task_id TEXT,
+            status TEXT NOT NULL,
+            options_json TEXT NOT NULL,
+            remaining_job_ids_json TEXT NOT NULL,
+            progress_json TEXT NOT NULL,
+            pause_reason TEXT,
+            error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            finished_at TIMESTAMP NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_greeting_runs_status ON greeting_runs(status);
         """
     )
     conn.commit()

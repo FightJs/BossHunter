@@ -7,7 +7,7 @@ import { Switch } from '@/components/ui/switch'
 import type { WorkbenchTask } from '@/hooks/useDashboard'
 
 type PlatformId = 'boss' | 'zhilian' | '51job'
-type ExecutionMode = 'safe_serial' | 'pipelined' | 'parallel_pilot'
+type ExecutionMode = 'safe_serial' | 'pipelined' | 'parallel_pilot' | 'parallel_boss_zhilian' | 'parallel_all_platforms'
 
 interface PlatformDraft {
   enabled: boolean
@@ -122,7 +122,7 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
         setOrder(mode === 'full' ? ['boss'] : (nextOrder.length ? nextOrder : ['boss']))
         setAutoScore(mode === 'full' || config?.collection?.auto_score_default === true)
         const configuredMode = config?.collection?.execution_mode
-        setExecutionMode(configuredMode === 'pipelined' || configuredMode === 'parallel_pilot' ? configuredMode : 'safe_serial')
+        setExecutionMode(configuredMode === 'pipelined' || configuredMode === 'parallel_pilot' || configuredMode === 'parallel_boss_zhilian' || configuredMode === 'parallel_all_platforms' ? configuredMode : 'safe_serial')
         setParallelPilotEnabled(config?.collection?.parallel_pilot_enabled === true)
       })
       .catch(() => {
@@ -238,7 +238,7 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
           <div className="mt-4 rounded-2xl border border-primary/20 bg-[#FFF0E5] p-4">
             <div className="text-sm font-black text-primary">采集进行中</div>
             {activeTask.progress.execution && <div className="mt-1 text-xs text-muted">
-              {activeTask.progress.execution.effective_mode === 'parallel_pilot' ? '受控并行' : activeTask.progress.execution.effective_mode === 'pipelined' ? '流水线加速' : '安全串行'}
+              {activeTask.progress.execution.effective_mode === 'parallel_all_platforms' ? '三平台并行' : activeTask.progress.execution.effective_mode === 'parallel_boss_zhilian' ? 'BOSS + 智联并行' : activeTask.progress.execution.effective_mode === 'parallel_pilot' ? '受控并行' : activeTask.progress.execution.effective_mode === 'pipelined' ? '流水线加速' : '安全串行'}
               {typeof activeTask.progress.execution.active_workers === 'number' && ` · ${activeTask.progress.execution.active_workers} 个采集工作者`}
               {typeof activeTask.progress.execution.active_browser_targets === 'number' && ` · 浏览器标签 ${activeTask.progress.execution.active_browser_targets}/${activeTask.progress.execution.browser_target_limit || 1}`}
               {activeTask.progress.execution.degraded && ` · 已降级：${activeTask.progress.execution.degradation_reason || '已回到安全模式'}`}
@@ -302,17 +302,23 @@ export function CollectJobsDialog({ open, mode = 'collect', activeTask, onClose,
             <Select className="mt-2" value={executionMode} onChange={event => setExecutionMode(event.target.value as ExecutionMode)}>
               <option value="safe_serial">安全串行</option>
               <option value="pipelined" disabled={!autoScore}>流水线加速（采集期间评分）</option>
-              <option value="parallel_pilot" disabled={!parallelPilotEnabled || !drafts.zhilian.enabled || !drafts['51job'].enabled}>受控并行（智联 + 51job）</option>
+              <option value="parallel_pilot" disabled={!drafts.zhilian.enabled || !drafts['51job'].enabled}>受控并行（智联 + 51job）</option>
+              <option value="parallel_boss_zhilian" disabled={!drafts.boss.enabled || !drafts.zhilian.enabled}>高风险并行（BOSS + 智联）</option>
+              <option value="parallel_all_platforms" disabled={!drafts.boss.enabled || !drafts.zhilian.enabled || !drafts['51job'].enabled}>试点并行（三平台）</option>
             </Select>
           </label>
           <p className="mt-2 text-xs leading-5 text-muted">
             {executionMode === 'parallel_pilot'
-              ? '仅在服务端试点开启且同时选择智联和前程无忧时生效，最多两个采集工作者；BOSS 不会并行。'
+              ? '同时选择智联和前程无忧时生效，最多两个采集工作者；BOSS 不会并行。触发验证码或限流会停止本轮。'
+              : executionMode === 'parallel_boss_zhilian'
+                ? '高风险试点：BOSS 和智联各使用一个独立标签页；任一平台触发验证码、限流或浏览器异常会停止本轮。'
+              : executionMode === 'parallel_all_platforms'
+                ? '最高风险试点：BOSS、智联和 51job 各使用一个独立标签页；任一平台触发验证码、限流或浏览器异常会停止本轮。'
               : executionMode === 'pipelined'
                 ? '已入库岗位会在后续平台采集期间进行 AI 评分，不增加浏览器访问频率。'
                 : '按队列逐个平台采集，兼容所有平台与既有风控策略。'}
           </p>
-          {!parallelPilotEnabled && <p className="mt-1 text-xs text-muted">受控并行当前未开放，会自动保留为安全模式。</p>}
+          {!parallelPilotEnabled && <p className="mt-1 text-xs text-muted">首次选择并行模式会自动启用对应的服务端试点开关；请先确认浏览器已登录两个平台。</p>}
         </div>}
 
         <label className="mt-4 flex items-center justify-between rounded-2xl border border-card-border bg-white p-4"><div><div className="text-sm font-black">{mode === 'full' ? '全流程自动评分' : '采集后自动评分'}</div><p className="mt-1 text-xs leading-5 text-muted">{mode === 'full' ? '全流程必须先评分；评分后进入人工确认，再按平台适配器执行招呼和监测。' : '默认关闭；开启后只评分本轮新增岗位，评分结束即停止，不发送消息、不投递、不监测。'}</p></div><Switch checked={mode === 'full' || autoScore} onChange={mode === 'full' ? () => undefined : setAutoScore} disabled={mode === 'full'} /></label>

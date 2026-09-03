@@ -4,6 +4,7 @@ from pathlib import Path
 
 from bosshunter.config import load_config
 from bosshunter.ai.scorer import get_scoring_concurrency
+from bosshunter.ai.greeter import get_greeting_concurrency
 
 
 class ScoringConfigTests(unittest.TestCase):
@@ -20,6 +21,12 @@ class ScoringConfigTests(unittest.TestCase):
         self.assertEqual(get_scoring_concurrency({"ai": {"scoring_concurrency": 99}}), 3)
         self.assertEqual(get_scoring_concurrency({"ai": {"scoring_concurrency": "invalid"}}), 1)
 
+    def test_greeting_concurrency_is_clamped_to_one_through_three(self):
+        self.assertEqual(get_greeting_concurrency({}), 2)
+        self.assertEqual(get_greeting_concurrency({"ai": {"greeting_concurrency": 0}}), 1)
+        self.assertEqual(get_greeting_concurrency({"ai": {"greeting_concurrency": 99}}), 3)
+        self.assertEqual(get_greeting_concurrency({"ai": {"greeting_concurrency": "invalid"}}), 1)
+
     def test_malformed_config_sections_fall_back_to_safe_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.yaml"
@@ -31,6 +38,45 @@ class ScoringConfigTests(unittest.TestCase):
         self.assertEqual(config["ai"]["provider"], "anthropic")
         self.assertEqual(config["scoring"]["threshold"], 71)
         self.assertEqual(config["monitor"]["interval"], 30)
+
+    def test_legacy_ai_connection_becomes_the_default_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.yaml"
+            path.write_text(
+                "ai:\n  service: deepseek\n  provider: openai_compatible\n  model: deepseek-chat\n  api_key: old-secret\n",
+                encoding="utf-8",
+            )
+
+            config = load_config(path)
+
+        self.assertEqual(config["ai"]["active_profile_id"], "default")
+        self.assertEqual(config["ai"]["profiles"][0]["name"], "默认 API")
+        self.assertEqual(config["ai"]["profiles"][0]["api_key"], "old-secret")
+        self.assertEqual(config["ai"]["service"], "deepseek")
+
+    def test_selected_profile_never_inherits_a_previous_profile_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.yaml"
+            path.write_text(
+                """ai:
+  api_key: stale-root-key
+  active_profile_id: backup
+  profiles:
+    - id: primary
+      service: anthropic
+      api_key: primary-key
+    - id: backup
+      service: custom
+      base_url: https://api.example.com
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(path)
+
+        self.assertEqual(config["ai"]["active_profile_id"], "backup")
+        self.assertNotIn("api_key", config["ai"])
+        self.assertEqual(config["ai"]["base_url"], "https://api.example.com")
 
 
 if __name__ == "__main__":

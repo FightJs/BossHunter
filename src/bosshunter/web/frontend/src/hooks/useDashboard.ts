@@ -10,6 +10,53 @@ interface ActivityData {
   cnt: number
 }
 
+export interface GreetingCurrentJob {
+  id: string
+  company: string
+  title: string
+}
+
+export interface GreetingProgress {
+  completed: number
+  total: number
+  generated: number
+  failed: number
+  selected?: number
+  remaining?: number
+  current_job?: GreetingCurrentJob | null
+}
+
+export interface SendCurrentJob {
+  id: string
+  company: string
+  title: string
+}
+
+export interface SendProgress {
+  total: number
+  attempted: number
+  sent: number
+  failed: number
+  deferred?: number
+  current_job?: SendCurrentJob | null
+  status?: string
+}
+
+export interface ScoringCurrentJob {
+  id: string
+  company: string
+  title: string
+}
+
+export interface ScoringProgress {
+  completed: number
+  total: number
+  scored: number
+  filtered: number
+  failed: number
+  active_jobs: ScoringCurrentJob[]
+}
+
 interface Job {
   id: string
   source_platform?: 'boss' | 'zhilian' | string
@@ -50,7 +97,7 @@ interface TopCompany {
 
 export interface WorkbenchTask {
   id: string
-  mode: 'full' | 'collect' | 'rescore' | 'monitor' | 'deliver'
+  mode: 'full' | 'collect' | 'score' | 'rescore' | 'greet' | 'monitor' | 'deliver'
   label: string
   status: string
   logs: string[]
@@ -62,7 +109,12 @@ export interface WorkbenchTask {
   can_resume?: boolean
   metrics?: Record<string, number>
   progress?: CollectionProgress
+  greeting_progress?: GreetingProgress
+  scoring_progress?: ScoringProgress
+  send_progress?: SendProgress
+  current_job?: GreetingCurrentJob | null
   checkpoint?: { stage?: string; [key: string]: unknown }
+  resources?: string[]
 }
 
 export interface CollectionPlatformProgress {
@@ -96,8 +148,8 @@ export interface CollectionProgress {
 }
 
 export interface CollectionExecutionProgress {
-  requested_mode?: 'safe_serial' | 'pipelined' | 'parallel_pilot' | string
-  effective_mode?: 'safe_serial' | 'pipelined' | 'parallel_pilot' | string
+  requested_mode?: 'safe_serial' | 'pipelined' | 'parallel_pilot' | 'parallel_boss_zhilian' | 'parallel_all_platforms' | string
+  effective_mode?: 'safe_serial' | 'pipelined' | 'parallel_pilot' | 'parallel_boss_zhilian' | 'parallel_all_platforms' | string
   degraded?: boolean
   degradation_reason?: string
   active_platforms?: string[]
@@ -112,12 +164,38 @@ interface WorkbenchData {
   funnel: FunnelData
   funnel_today: FunnelData
   pending_confirmation: Job[]
+  today_pending_confirmation?: Job[]
   pending_greetings: Job[]
   send_errors: Job[]
   needs_resume: Job[]
   send_quota: { daily_limit: number; sent: number; remaining: number; exhausted: boolean }
   task: WorkbenchTask | null
+  active_tasks?: WorkbenchTask[]
+  paused_tasks?: WorkbenchTask[]
+  tasks?: WorkbenchTask[]
   last_task: WorkbenchTask | null
+  scoring_runs?: ScoringRun[]
+  greeting_runs?: GreetingRun[]
+}
+
+export interface ScoringRun {
+  id: string
+  status: string
+  task_id?: string | null
+  remaining_job_ids: string[]
+  pause_reason?: string
+  recoverable?: boolean
+  progress?: ScoringProgress
+}
+
+export interface GreetingRun {
+  id: string
+  status: string
+  task_id?: string | null
+  remaining_job_ids: string[]
+  pause_reason?: string
+  recoverable?: boolean
+  progress?: GreetingProgress
 }
 
 interface HistoryDetailPayload {
@@ -148,12 +226,18 @@ const emptyWorkbench: WorkbenchData = {
   funnel: {},
   funnel_today: {},
   pending_confirmation: [],
+  today_pending_confirmation: [],
   pending_greetings: [],
   send_errors: [],
   needs_resume: [],
   send_quota: { daily_limit: 30, sent: 0, remaining: 30, exhausted: false },
   task: null,
+  active_tasks: [],
+  paused_tasks: [],
+  tasks: [],
   last_task: null,
+  scoring_runs: [],
+  greeting_runs: [],
 }
 
 type DashboardDataScope = 'workbench' | 'jobs' | 'monitor' | 'all'
@@ -198,7 +282,7 @@ export function useDashboard(scope: DashboardDataScope = 'all') {
     }
   }
 
-  const startTask = async (mode: 'full' | 'collect' | 'rescore' | 'monitor' | 'deliver', options?: Record<string, unknown>) => {
+  const startTask = async (mode: 'full' | 'collect' | 'score' | 'rescore' | 'greet' | 'monitor' | 'deliver', options?: Record<string, unknown>) => {
     const res = await fetch('/api/workbench/task', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -210,7 +294,12 @@ export function useDashboard(scope: DashboardDataScope = 'all') {
       throw new Error([data.error || '启动失败', details].filter(Boolean).join('：'))
     }
     const task = await res.json() as WorkbenchTask
-    setWorkbench(prev => ({ ...prev, task, last_task: task }))
+    setWorkbench(prev => ({
+      ...prev,
+      task: prev.task || task,
+      active_tasks: [...(prev.active_tasks || (prev.task ? [prev.task] : [])), task],
+      last_task: task,
+    }))
     void fetchAll()
     return task
   }
@@ -222,7 +311,9 @@ export function useDashboard(scope: DashboardDataScope = 'all') {
       throw new Error(data.error || '停止失败')
     }
     const task = await res.json() as WorkbenchTask
-    setWorkbench(prev => ({ ...prev, task, last_task: task }))
+    // Legacy single-task shape retained for older clients:
+    // setWorkbench(prev => ({ ...prev, task, last_task: task }))
+    setWorkbench(prev => ({ ...prev, task, active_tasks: (prev.active_tasks || []).map(item => item.id === task.id ? task : item), paused_tasks: (prev.paused_tasks || []).filter(item => item.id !== task.id), last_task: task }))
     void fetchAll()
     return task
   }
@@ -234,7 +325,7 @@ export function useDashboard(scope: DashboardDataScope = 'all') {
       throw new Error(data.error || '暂停失败')
     }
     const task = await res.json() as WorkbenchTask
-    setWorkbench(prev => ({ ...prev, task, last_task: task }))
+    setWorkbench(prev => ({ ...prev, task, active_tasks: (prev.active_tasks || []).map(item => item.id === task.id ? task : item), paused_tasks: (prev.paused_tasks || []).filter(item => item.id !== task.id), last_task: task }))
     void fetchAll()
     return task
   }
@@ -250,7 +341,19 @@ export function useDashboard(scope: DashboardDataScope = 'all') {
       throw new Error(data.error || '继续执行失败')
     }
     const task = await res.json() as WorkbenchTask
-    setWorkbench(prev => ({ ...prev, task, last_task: task }))
+    setWorkbench(prev => ({ ...prev, task, active_tasks: [...(prev.active_tasks || []).filter(item => item.id !== task.id), task], paused_tasks: (prev.paused_tasks || []).filter(item => item.id !== task.id), last_task: task }))
+    void fetchAll()
+    return task
+  }
+
+  const retryTask = async (taskId: string) => {
+    const res = await fetch(`/api/workbench/task/${taskId}/retry`, { method: 'POST' })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      throw new Error(data.error || '重试失败')
+    }
+    const task = await res.json() as WorkbenchTask
+    setWorkbench(prev => ({ ...prev, task, active_tasks: [...(prev.active_tasks || []).filter(item => item.id !== task.id), task], last_task: task }))
     void fetchAll()
     return task
   }
@@ -273,6 +376,7 @@ export function useDashboard(scope: DashboardDataScope = 'all') {
     stopTask,
     pauseTask,
     resumeTask,
+    retryTask,
   }
 }
 

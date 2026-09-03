@@ -33,7 +33,7 @@ SORT_OPTIONS = {
     "zhilian": {"default", "newest"},
     "51job": {"default"},
 }
-EXECUTION_MODES = {"safe_serial", "pipelined", "parallel_pilot"}
+EXECUTION_MODES = {"safe_serial", "pipelined", "parallel_pilot", "parallel_boss_zhilian", "parallel_all_platforms"}
 
 
 class _StopSignal:
@@ -66,7 +66,7 @@ class _StopSignal:
 
 
 class _BrowserTargetBudget:
-    """Bound background tabs owned by the non-BOSS parallel pilot."""
+    """Bound background tabs owned by a controlled parallel collection run."""
 
     def __init__(self, limit: int, stop_event: _StopSignal):
         self.limit = max(1, min(int(limit), 3))
@@ -166,7 +166,11 @@ class _ScoringPipeline:
 
             score_config = dict(self.config)
             score_config["_workbench_stop_event"] = self.stop_event
+            score_config["_workbench_pause_event"] = self.config.get("_workbench_pause_event")
             score_config["_workbench_score_progress"] = lambda _state: self.on_progress()
+            checkpoint_callback = self.config.get("_workbench_score_checkpoint")
+            if callable(checkpoint_callback):
+                score_config["_workbench_score_checkpoint"] = checkpoint_callback
             score_jobs(score_config, scope="selected", job_ids=job_ids, limit=None, force_rescore=False)
         except Exception as exc:
             self.errors.append(f"自动评分失败：{type(exc).__name__}: {str(exc)[:240]}")
@@ -279,7 +283,7 @@ def validate_collection_options(options: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("auto_score 必须是布尔值")
     execution_mode = str(options.get("execution_mode") or "safe_serial").strip()
     if execution_mode not in EXECUTION_MODES:
-        raise ValueError("采集速度模式只支持 safe_serial、pipelined 或 parallel_pilot")
+        raise ValueError("采集速度模式只支持 safe_serial、pipelined、parallel_pilot、parallel_boss_zhilian 或 parallel_all_platforms")
     normalized: dict[str, Any] = {
         "platform_order": order,
         "auto_score": bool(options.get("auto_score")),
@@ -451,8 +455,8 @@ class CollectionOrchestrator:
         self._uses_default_registry = registry is None
         self.registry = registry or CollectorRegistry({
             "boss": BossCollector,
-            "zhilian": ZhilianCollector,
-            "51job": Job51Collector,
+            "zhilian": lambda: ZhilianCollector(config=config),
+            "51job": lambda: Job51Collector(config=config),
         })
         self.run_id = run_id or str(uuid4())
         self.task_id = task_id
@@ -568,13 +572,12 @@ class CollectionOrchestrator:
                 })
                 all_new_ids.extend(result.new_job_ids)
                 self._persist(states, all_new_ids, platform, stop_reason=result.reason_code, error=result.error)
-                # A verification, rate-limit, or unknown blocking page is an
-                # account-level signal. Stop the entire serial queue instead
-                # of immediately moving the same browser session to another
-                # recruitment platform.
+                # A user stop or browser disconnect invalidates the whole
+                # browser session. Platform-specific verification/rate-limit
+                # signals are isolated to that platform so later platforms
+                # can still run (and retain their own durable checkpoint).
                 if (
-                    result.status == "blocked"
-                    or result.reason_code in {"user_stopped", "browser_disconnected"}
+                    result.reason_code in {"user_stopped", "browser_disconnected"}
                     or (self.stop_event and self.stop_event.is_set())
                 ):
                     break
@@ -595,6 +598,10 @@ class CollectionOrchestrator:
 
                 score_config = dict(self.config)
                 score_config["_workbench_stop_event"] = self.stop_event
+                score_config["_workbench_pause_event"] = self.pause_event
+                checkpoint_callback = self.config.get("_workbench_score_checkpoint")
+                if callable(checkpoint_callback):
+                    score_config["_workbench_score_checkpoint"] = checkpoint_callback
                 score_jobs(score_config, scope="selected", job_ids=unique_new_ids, limit=None, force_rescore=False)
             except Exception as exc:
                 outcome = "completed_with_errors"
@@ -616,10 +623,34 @@ class CollectionOrchestrator:
 
     def _effective_execution_mode(self, options: dict[str, Any]) -> tuple[str, str]:
         requested = str(options.get("execution_mode") or "safe_serial")
-        if requested != "parallel_pilot":
+        if requested not in {"parallel_pilot", "parallel_boss_zhilian", "parallel_all_platforms"}:
             return requested, ""
         collection_cfg = self.config.get("collection", {}) if isinstance(self.config.get("collection"), dict) else {}
         selected = set(options.get("platform_order") or [])
+        if requested == "parallel_all_platforms":
+            if collection_cfg.get("parallel_all_platforms_enabled") is not True:
+                return ("pipelined" if options.get("auto_score") else "safe_serial"), "三平台并行尚未开放，已使用安全模式"
+            if selected != {"boss", "zhilian", "51job"}:
+                return ("pipelined" if options.get("auto_score") else "safe_serial"), "三平台并行需要同时选择 BOSS、智联和 51job"
+            try:
+                target_limit = int(collection_cfg.get("max_browser_targets", 3) or 3)
+            except (TypeError, ValueError):
+                target_limit = 3
+            if target_limit < 3:
+                return ("pipelined" if options.get("auto_score") else "safe_serial"), "三平台并行至少需要 3 个浏览器标签页配额"
+            return "parallel_all_platforms", ""
+        if requested == "parallel_boss_zhilian":
+            if collection_cfg.get("parallel_boss_zhilian_enabled") is not True:
+                return ("pipelined" if options.get("auto_score") else "safe_serial"), "BOSS + 智联并行尚未开放，已使用安全模式"
+            if not {"boss", "zhilian"} <= selected:
+                return ("pipelined" if options.get("auto_score") else "safe_serial"), "BOSS + 智联并行需要同时选择 BOSS 和智联"
+            try:
+                target_limit = int(collection_cfg.get("max_browser_targets", 3) or 3)
+            except (TypeError, ValueError):
+                target_limit = 3
+            if target_limit < 2:
+                return ("pipelined" if options.get("auto_score") else "safe_serial"), "BOSS + 智联并行至少需要 2 个浏览器标签页配额"
+            return "parallel_boss_zhilian", ""
         if collection_cfg.get("parallel_pilot_enabled") is not True:
             return ("pipelined" if options.get("auto_score") else "safe_serial"), "并行试点尚未开放，已使用安全模式"
         if not {"zhilian", "51job"} <= selected:
@@ -628,8 +659,14 @@ class CollectionOrchestrator:
 
     @staticmethod
     def _stage_plan(order: list[str], mode: str) -> list[list[str]]:
-        if mode != "parallel_pilot":
+        if mode not in {"parallel_pilot", "parallel_boss_zhilian", "parallel_all_platforms"}:
             return [[platform] for platform in order]
+        if mode == "parallel_all_platforms":
+            return [list(order)]
+        if mode == "parallel_boss_zhilian":
+            paired = [platform for platform in ("boss", "zhilian") if platform in order]
+            remaining = [platform for platform in order if platform not in paired]
+            return ([paired] if len(paired) == 2 else []) + [[platform] for platform in remaining]
         stages: list[list[str]] = []
         pending_non_boss: list[str] = []
         for platform in order:
@@ -645,7 +682,7 @@ class CollectionOrchestrator:
         return stages
 
     def _run_accelerated(self, options: dict[str, Any]) -> dict[str, Any]:
-        """Run serial stages or the bounded non-BOSS parallel pilot.
+        """Run serial stages or a bounded controlled parallel pilot.
 
         Each platform receives its own SQLite connection. ``_db_lock`` keeps
         writes deterministic while the database's unique source identity index
@@ -680,7 +717,12 @@ class CollectionOrchestrator:
             target_limit = int(collection_cfg.get("max_browser_targets", 3) or 3)
         except (TypeError, ValueError):
             target_limit = 3
-        budget = _BrowserTargetBudget(target_limit, stop_signal) if options["execution_mode"] == "parallel_pilot" else None
+        try:
+            worker_limit = int(collection_cfg.get("max_non_boss_workers", 2) or 2)
+        except (TypeError, ValueError):
+            worker_limit = 2
+        worker_limit = max(1, min(worker_limit, 3))
+        budget = _BrowserTargetBudget(target_limit, stop_signal) if options["execution_mode"] in {"parallel_pilot", "parallel_boss_zhilian", "parallel_all_platforms"} else None
         pipeline = _ScoringPipeline(self.config, stop_signal, lambda: self._emit_execution(states, all_new_ids, budget, options)) if options.get("auto_score") else None
         platform_results: list[PlatformCollectionResult] = []
         current_platform = ""
@@ -701,7 +743,8 @@ class CollectionOrchestrator:
                     index = order.index(platform) + 1
                     stage_results.append(self._run_platform(platform, index, len(order), options, states, all_new_ids, stop_signal, budget))
                 else:
-                    with ThreadPoolExecutor(max_workers=min(2, len(stage)), thread_name_prefix="bosshunter-collect") as executor:
+                    stage_worker_limit = 3 if options["execution_mode"] == "parallel_all_platforms" else 2 if options["execution_mode"] == "parallel_boss_zhilian" else worker_limit
+                    with ThreadPoolExecutor(max_workers=min(stage_worker_limit, len(stage)), thread_name_prefix="bosshunter-collect") as executor:
                         futures = {
                             executor.submit(
                                 self._run_platform,
@@ -725,7 +768,7 @@ class CollectionOrchestrator:
                                     platform, "failed", "worker_error", f"{platform} 采集工作者异常", error=str(exc)[:500],
                                 )
                             stage_results.append(result)
-                            if result.status == "blocked" or result.reason_code in {"browser_disconnected", "user_stopped"}:
+                            if result.reason_code in {"browser_disconnected", "user_stopped"}:
                                 stop_signal.set()
                 for result in stage_results:
                     platform_results.append(result)
@@ -736,7 +779,7 @@ class CollectionOrchestrator:
                 if pipeline is not None:
                     pipeline.submit([job_id for result in stage_results for job_id in result.new_job_ids])
                 self._emit_execution(states, all_new_ids, budget, options)
-                if any(result.status == "blocked" or result.reason_code in {"browser_disconnected", "user_stopped"} for result in stage_results):
+                if any(result.reason_code in {"browser_disconnected", "user_stopped"} for result in stage_results):
                     halted = True
                     break
         finally:
@@ -838,19 +881,35 @@ class CollectionOrchestrator:
 
     def _collector_for(self, platform: str, conn, budget: _BrowserTargetBudget | None):
         if platform == "boss" and self._uses_default_registry:
-            return BossCollector(config=self.config, safety_conn=conn)
+            if budget is None:
+                return BossCollector(config=self.config, safety_conn=conn)
+            from bosshunter.collection.platforms.boss import BossBrowser
+            return BossCollector(
+                config=self.config,
+                safety_conn=conn,
+                browser=BossBrowser(
+                    new_tab=budget.open, close_tab=budget.close, evaluate=evaluate,
+                    navigate=navigate, scroll=scroll, wait_for_load=wait_for_load,
+                ),
+            )
         if budget is None or not self._uses_default_registry:
             return self.registry.get(platform)
         if platform == "zhilian":
-            return ZhilianCollector(browser=ZhilianBrowser(
-                new_tab=budget.open, close_tab=budget.close, evaluate=evaluate, scroll=scroll, wait_for_load=wait_for_load,
-                click_action=click, type_text_action=type_text, press_key_action=press_key, navigate_action=navigate,
-            ))
+            return ZhilianCollector(
+                config=self.config,
+                browser=ZhilianBrowser(
+                    new_tab=budget.open, close_tab=budget.close, evaluate=evaluate, scroll=scroll, wait_for_load=wait_for_load,
+                    click_action=click, type_text_action=type_text, press_key_action=press_key, navigate_action=navigate,
+                ),
+            )
         if platform == "51job":
-            return Job51Collector(browser=Job51Browser(
-                new_tab=budget.open, close_tab=budget.close, evaluate=evaluate, scroll=scroll,
-                wait_for_load=wait_for_load, navigate_action=navigate,
-            ))
+            return Job51Collector(
+                config=self.config,
+                browser=Job51Browser(
+                    new_tab=budget.open, close_tab=budget.close, evaluate=evaluate, scroll=scroll,
+                    wait_for_load=wait_for_load, navigate_action=navigate,
+                ),
+            )
         return self.registry.get(platform)
 
     @staticmethod

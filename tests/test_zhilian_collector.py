@@ -210,6 +210,54 @@ class ZhilianFixtureTests(TestCase):
         self.assertEqual(len(collected), 1)
         self.assertEqual(opened[1], "https://www.zhaopin.com/jobdetail/zl-1.htm")
 
+    def test_collector_uses_configured_zhilian_detail_delay(self):
+        responses = {
+            "list": json.dumps({"items": [
+                {"source_job_id": "zl-a", "title": "岗位A", "company": "公司A", "city": "北京"},
+                {"source_job_id": "zl-b", "title": "岗位B", "company": "公司B", "city": "北京"},
+            ]}),
+            "detail": json.dumps({
+                "source_job_id": "zl-a",
+                "title": "岗位A",
+                "company": "公司A",
+                "city": "北京",
+                "jd": "JD",
+            }),
+        }
+        sleeps: list[float] = []
+        browser = ZhilianBrowser(
+            new_tab=lambda _url, **_kwargs: "tab-config",
+            close_tab=lambda _target: True,
+            evaluate=lambda _target, script: responses["detail" if "describtion__detail-content" in script else "list"],
+            scroll=lambda *_args, **_kwargs: True,
+            wait_for_load=lambda *_args, **_kwargs: True,
+        )
+        collected = []
+        hooks = CollectorHooks(
+            stop_event=None,
+            on_list_candidate=lambda candidate: True,
+            on_candidate=lambda candidate: collected.append(candidate) or len(collected) < 2,
+            on_parse_failed=lambda reason: self.fail(reason),
+            on_event=lambda **_kwargs: None,
+        )
+        result = ZhilianCollector(
+            browser=browser,
+            sleep=sleeps.append,
+            uniform=lambda _low, _high: 18.0,
+            config={
+                "collection": {
+                    "zhilian_detail_delay_min_seconds": 18,
+                    "zhilian_detail_delay_max_seconds": 26,
+                }
+            },
+        ).collect(
+            PlatformCollectionRequest("zhilian", ["AI"], ["北京"], {"北京": "530"}, max_pages=1),
+            hooks,
+        )
+
+        self.assertEqual(result.reason_code, "callback_stopped")
+        self.assertEqual(sleeps, [18.0])
+
     def test_collector_submits_keyword_through_shared_browser_input_actions(self):
         responses = {
             "list": json.dumps({"items": [

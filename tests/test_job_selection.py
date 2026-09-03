@@ -5,6 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from bosshunter.db import (
+    add_history,
     get_db,
     get_funnel_stats,
     get_jobs_pending_confirmation,
@@ -59,6 +60,8 @@ class JobSelectionTests(unittest.TestCase):
         redirect_pos = script.index("redirect-url")
         wrapper_pos = script.index("btn-startchat-wrap")
         self.assertLess(redirect_pos, wrapper_pos)
+        self.assertIn("button, a, [role=\"button\"]", script)
+        self.assertIn("text-fallback", script)
 
     def test_preset_confirmation_uses_background_dom_click(self):
         with patch(
@@ -470,8 +473,80 @@ class JobSelectionTests(unittest.TestCase):
         script = evaluate_mock.call_args.args[1]
         self.assertIn(".chat-conversation", script)
         self.assertIn(".friend-content.selected", script)
+        self.assertIn("$route", script)
+        self.assertIn("jobId", script)
+        self.assertIn("position-content", script)
         self.assertNotIn("document.body.innerText", script)
         self.assertNotIn("performance.getEntriesByType", script)
+
+    def test_send_greeting_classifies_closed_job_before_looking_for_chat_button(self):
+        job = {
+            "id": "closed-job",
+            "url": "https://www.zhipin.com/job_detail/closed-job.html",
+        }
+
+        with patch("bosshunter.executor.sender.new_tab", return_value="target-1"), \
+             patch(
+                 "bosshunter.executor.sender.evaluate",
+                 return_value='{"success": false, "error": "job_closed", "history_detail": "岗位已关闭或下架，无法投递", "skip_backoff": true}',
+             ) as evaluate_mock, \
+             patch("bosshunter.executor.sender._click_chat_button") as click_chat_button, \
+             patch("bosshunter.executor.sender.close_tab") as close_tab, \
+             patch("bosshunter.executor.sender.time.sleep"):
+            result, target_id = _send_greeting_once(
+                job,
+                "您好，我对这个岗位很感兴趣。",
+                {"browse_before_greet": False},
+            )
+
+        self.assertIsNone(target_id)
+        self.assertEqual(result["error"], "job_closed")
+        self.assertEqual(result["history_detail"], "岗位已关闭或下架，无法投递")
+        evaluate_mock.assert_called_once()
+        click_chat_button.assert_not_called()
+        close_tab.assert_called_once_with("target-1")
+
+    def test_job_page_check_script_recognizes_closed_and_stopped_jobs(self):
+        # Keep the platform-state markers close to the sender flow so a BOSS
+        # wording change cannot silently turn a terminal job into a button
+        # lookup failure again.
+        source = Path(__file__).resolve().parents[1] / "src/bosshunter/executor/sender.py"
+        sender_source = source.read_text(encoding="utf-8")
+
+        self.assertIn("已关闭", sender_source)
+        self.assertIn("已下架", sender_source)
+        self.assertIn("停止招聘", sender_source)
+        self.assertIn("error: 'job_closed'", sender_source)
+        self.assertIn("error: 'boss_login_required'", sender_source)
+        self.assertIn("go_chat_tosign", sender_source)
+        self.assertIn("登录查看完整内容", sender_source)
+
+    def test_send_greeting_classifies_logged_out_job_before_clicking_chat_button(self):
+        job = {
+            "id": "logged-out-job",
+            "url": "https://www.zhipin.com/job_detail/logged-out-job.html",
+        }
+
+        with patch("bosshunter.executor.sender.new_tab", return_value="target-1"), \
+             patch(
+                 "bosshunter.executor.sender.evaluate",
+                 return_value='{"success": false, "error": "boss_login_required", "history_detail": "BOSS 直聘登录状态已失效，请先在已连接的 Chrome 中重新登录，再重新发送", "skip_backoff": true}',
+             ) as evaluate_mock, \
+             patch("bosshunter.executor.sender._click_chat_button") as click_chat_button, \
+             patch("bosshunter.executor.sender.close_tab") as close_tab, \
+             patch("bosshunter.executor.sender.time.sleep"):
+            result, target_id = _send_greeting_once(
+                job,
+                "您好，我对这个岗位很感兴趣。",
+                {"browse_before_greet": False},
+            )
+
+        self.assertIsNone(target_id)
+        self.assertEqual(result["error"], "boss_login_required")
+        self.assertIn("登录状态已失效", result["history_detail"])
+        evaluate_mock.assert_called_once()
+        click_chat_button.assert_not_called()
+        close_tab.assert_called_once_with("target-1")
 
     def test_wait_for_chat_page_adopts_preexisting_chat_when_active_job_matches(self):
         job = {
@@ -597,6 +672,54 @@ class JobSelectionTests(unittest.TestCase):
 
             self.assertEqual(sent, 0)
             close_tab.assert_called_once_with("task-target")
+
+    def test_send_greetings_publishes_current_company_and_live_counts(self):
+        jobs = [_job("progress-a"), _job("progress-b")]
+        jobs[0]["company"] = "Alpha 科技"
+        jobs[0]["title"] = "AI 工程师"
+        jobs[1]["company"] = "Beta 软件"
+        jobs[1]["title"] = "Python 工程师"
+        for job in jobs:
+            job["greeting"] = f"您好，我对 {job['id']} 很感兴趣。"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "bosshunter.db"
+            db = get_db(db_path)
+            try:
+                for job in jobs:
+                    insert_job(db, job)
+                    update_job_status(db, job["id"], "ready")
+                    update_job_greeting(db, job["id"], job["greeting"])
+            finally:
+                db.close()
+
+            states: list[dict] = []
+            config = {
+                "throttle": {
+                    "daily_limit": 10,
+                    "interval_min": 0,
+                    "interval_max": 0,
+                },
+                "_workbench_send_progress": states.append,
+            }
+            with patch("bosshunter.db.DB_PATH", db_path), \
+                 patch("bosshunter.executor.sender.should_take_day_off", return_value=False), \
+                 patch("bosshunter.executor.sender.SendWindowChecker.is_active", return_value=True), \
+                 patch(
+                     "bosshunter.executor.sender._send_greeting_once",
+                     return_value=({"success": True}, None),
+                 ):
+                sent = send_greetings(config, force=True)
+
+        self.assertEqual(sent, 2)
+        self.assertTrue(states)
+        self.assertEqual(states[0]["total"], 2)
+        self.assertEqual(states[0]["sent"], 0)
+        current_a = next(state for state in states if state.get("current_job"))
+        self.assertEqual(current_a["current_job"]["company"], "Alpha 科技")
+        finished = [state for state in states if state.get("attempted") == 2 and not state.get("current_job")]
+        self.assertTrue(finished)
+        self.assertEqual(finished[-1]["sent"], 2)
 
     def test_send_greetings_reports_failed_and_quota_deferred_jobs_separately(self):
         jobs = [_job(f"quota-{index}") for index in range(3)]
@@ -792,6 +915,21 @@ class JobSelectionTests(unittest.TestCase):
                 db.close()
 
         self.assertEqual([job["id"] for job in jobs], ["send-failed"])
+
+    def test_send_errors_expose_latest_history_detail_as_last_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = get_db(Path(tmp) / "bosshunter.db")
+            try:
+                insert_job(db, _job("send-failed"))
+                update_job_status(db, "send-failed", "error")
+                update_job_greeting(db, "send-failed", "Hi, this role looks like a strong fit.")
+                add_history(db, "send-failed", "error", "旧失败原因")
+                add_history(db, "send-failed", "error", "无法找到沟通按钮")
+                jobs = get_jobs_with_send_errors(db)
+            finally:
+                db.close()
+
+        self.assertEqual(jobs[0]["last_error"], "无法找到沟通按钮")
 
     def test_send_greetings_force_bypasses_send_window_restriction(self):
         # Arrange

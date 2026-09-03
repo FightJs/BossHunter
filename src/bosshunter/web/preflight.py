@@ -20,7 +20,7 @@ from bosshunter.browser.diagnostics import run_browser_diagnostics
 from bosshunter.collection.orchestrator import normalize_collection_options
 
 
-VALID_MODES = {"full", "collect", "rescore", "monitor"}
+VALID_MODES = {"full", "collect", "score", "rescore", "greet", "monitor"}
 
 
 def collect_preflight_checks(mode: str, config: dict, options: dict | None = None) -> list[dict[str, str]]:
@@ -38,7 +38,7 @@ def collect_preflight_checks(mode: str, config: dict, options: dict | None = Non
 		checks = _configuration_checks(mode, config, options)
 	if mode not in VALID_MODES:
 		return checks
-	ai_required = mode in {"full", "rescore"} or (
+	ai_required = mode in {"full", "score", "rescore", "greet"} or (
 		mode == "collect" and bool(collection_options and collection_options.get("auto_score"))
 	)
 
@@ -52,13 +52,18 @@ def collect_preflight_checks(mode: str, config: dict, options: dict | None = Non
 			checks.append(_check("browser_runtime", "浏览器连接", "error", "浏览器连接检测失败", "请重新启动 BossHunter 后再试。", "browser"))
 		return checks
 
-	with ThreadPoolExecutor(max_workers=2) as executor:
-		ai_future = executor.submit(check_ai_connection, deepcopy(config), True)
-		browser_future = executor.submit(check_browser_connection, deepcopy(config), collection_options)
-		for future, fallback in (
-			(ai_future, _check("ai_connection", "AI 接口连接", "error", "AI 接口检测失败", "请检查 AI 设置后重试。", "config")),
-			(
-				browser_future,
+	# Score and greeting runs are AI/DB-only.  They must not be blocked by an
+	# unavailable Chrome connection when launched alongside collection or a
+	# browser delivery task.
+	needs_browser = mode in {"full", "collect"}
+	with ThreadPoolExecutor(max_workers=2 if needs_browser else 1) as executor:
+		futures = [(
+			executor.submit(check_ai_connection, deepcopy(config), True),
+			_check("ai_connection", "AI 接口连接", "error", "AI 接口检测失败", "请检查 AI 设置后重试。", "config"),
+		)]
+		if needs_browser:
+			futures.append((
+				executor.submit(check_browser_connection, deepcopy(config), collection_options),
 				_check(
 					"browser_runtime",
 					"浏览器连接",
@@ -67,8 +72,10 @@ def collect_preflight_checks(mode: str, config: dict, options: dict | None = Non
 					"请重新启动 BossHunter 后再试。",
 					"browser",
 				),
-			),
-		):
+			))
+		else:
+			checks.append(_check("browser_runtime", "浏览器连接", "pass", "AI 独立任务不需要浏览器", "评分或招呼语生成只访问 AI 接口与本地岗位库。"))
+		for future, fallback in futures:
 			try:
 				checks.extend(future.result())
 			except Exception:
@@ -403,7 +410,7 @@ def _configuration_checks(mode: str, config: dict, options: dict | None = None) 
 		)
 		return checks
 
-	ai_required = mode in {"full", "rescore"} or (mode == "collect" and bool(options and options.get("auto_score")))
+	ai_required = mode in {"full", "score", "rescore", "greet"} or (mode == "collect" and bool(options and options.get("auto_score")))
 	if ai_required:
 		resume_path = config.get("profile", {}).get("resume_path", "")
 		if not resume_path or not Path(str(resume_path)).exists():

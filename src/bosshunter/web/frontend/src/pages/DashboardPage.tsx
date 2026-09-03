@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState } from 'react'
-import { useDashboard, type CollectionProgress, type HistoryItem, type Job, type WorkbenchTask } from '@/hooks/useDashboard'
+import { useDashboard, type CollectionProgress, type GreetingProgress, type GreetingRun, type HistoryItem, type Job, type ScoringProgress, type ScoringRun, type SendProgress, type WorkbenchTask } from '@/hooks/useDashboard'
 import { useJobSearch, type JobSortKey, type JobSortOrder } from '@/hooks/useJobSearch'
 import { Button } from '@/components/ui/button'
 import { JobsTable } from '@/components/dashboard/JobsTable'
 import { RecycleBinPanel } from '@/components/dashboard/RecycleBinPanel'
 import { ScoreJobsDialog } from '@/components/dashboard/ScoreJobsDialog'
 import { CollectJobsDialog } from '@/components/dashboard/CollectJobsDialog'
+import { TaskCompletionDialog } from '@/components/dashboard/TaskCompletionDialog'
 import { JobFilterBar } from '@/components/jobs/JobFilterBar'
 import { parseHistoryDetail } from '@/lib/historyDetail'
 import {
@@ -33,7 +34,7 @@ import {
   XCircle,
 } from 'lucide-react'
 
-type WorkbenchMode = 'full' | 'collect' | 'rescore' | 'monitor'
+type WorkbenchMode = 'full' | 'collect' | 'score' | 'greet' | 'rescore' | 'monitor'
 type DashboardView = 'workbench' | 'jobs' | 'monitor'
 type StatsScope = 'today' | 'total'
 
@@ -41,6 +42,8 @@ const TASK_STAGE_LABELS = [
   '开始采集岗位',
   '开始 AI 评分',
   '开始重新评分',
+  '开始生成招呼语',
+  '招呼语生成完成',
   'AI 评分进度',
   '等待前端确认投递',
   '发送失败待处理',
@@ -87,6 +90,21 @@ function taskStopReasonLabel(reason?: string) {
   if (reason === 'day_off') return '今日触发防检测休息策略，岗位已保留在“待发送招呼语”。'
   if (reason === 'stopped') return '任务已按你的要求停止，尚未处理的岗位仍保留在队列中。'
   return reason
+}
+
+function checkpointLabel(stage?: string) {
+  const labels: Record<string, string> = {
+    collect: '岗位采集',
+    collect_complete: '采集完成',
+    rescore: '重新评分',
+    score: 'AI 评分',
+    waiting_confirmation: '等待确认投递',
+    deliver: '准备投递',
+    greeting: '生成招呼语',
+    send: '发送招呼语',
+    monitor: '监测回复',
+  }
+  return labels[stage || ''] || stage || ''
 }
 
 function taskErrorFeedback(error: string) {
@@ -152,11 +170,53 @@ const modes: Array<{ mode: WorkbenchMode; title: string; description: string }> 
     description: '打开岗位采集窗口，选择 BOSS/智联/51job、最大页数、排序和执行顺序；默认只采集不评分。',
   },
   {
+    mode: 'score',
+    title: '单独 AI 评分',
+    description: '只处理岗位池中的未评分岗位；可与岗位采集并行，不打开招聘网站，也不会投递。',
+  },
+  {
+    mode: 'greet',
+    title: '单独生成招呼语',
+    description: '为今日待确认岗位批量生成招呼语；只写入岗位池，不发送消息，可与采集和评分分开运行。',
+  },
+  {
     mode: 'monitor',
     title: '单独监测',
     description: '只监测过往已投递项目；发现 HR 要简历或问题后进入对应处理。',
   },
 ]
+
+const MODE_RESOURCE_FALLBACK: Record<string, string[]> = {
+  full: ['pipeline', 'browser', 'collection', 'scoring', 'greeting', 'delivery', 'monitor'],
+  collect: ['browser', 'collection'],
+  score: ['scoring'],
+  rescore: ['scoring'],
+  greet: ['greeting'],
+  monitor: ['browser', 'monitor'],
+  deliver: ['browser', 'delivery', 'greeting'],
+}
+
+function taskResources(task: WorkbenchTask) {
+  return new Set(task.resources?.length ? task.resources : MODE_RESOURCE_FALLBACK[task.mode] || [])
+}
+
+function modesConflict(mode: WorkbenchMode, task: WorkbenchTask) {
+  if (mode === 'full' || task.mode === 'full') return true
+  const requested = new Set(MODE_RESOURCE_FALLBACK[mode] || [])
+  const occupied = taskResources(task)
+  return [...requested].some(resource => occupied.has(resource))
+}
+
+const COMPLETION_MODES = new Set<WorkbenchTask['mode']>(['collect', 'score', 'rescore', 'greet', 'deliver'])
+const TERMINAL_TASK_STATUSES = new Set(['completed', 'failed', 'stopped'])
+
+function taskSnapshot(value: unknown): WorkbenchTask | null {
+  if (!value || typeof value !== 'object') return null
+  const candidate = value as Partial<WorkbenchTask>
+  return typeof candidate.id === 'string' && typeof candidate.mode === 'string'
+    ? value as WorkbenchTask
+    : null
+}
 
 const statItems = [
   { key: '采集总数', todayLabel: '今日新增岗位', totalLabel: '累计采集岗位' },
@@ -176,6 +236,10 @@ const taskMetricItems = [
   { key: 'ai_passed', label: 'AI通过' },
   { key: 'ai_filtered', label: 'AI过滤' },
   { key: 'ai_failed', label: 'AI失败' },
+  { key: 'greeting_completed', label: '招呼语已处理' },
+  { key: 'greeting_total', label: '招呼语总数' },
+  { key: 'greeting_generated', label: '招呼语已生成' },
+  { key: 'greeting_failed', label: '招呼语失败' },
   { key: 'send_success', label: '发送成功' },
   { key: 'send_deferred', label: '待下次发送' },
   { key: 'send_remaining_quota', label: '今日剩余额度' },
@@ -302,6 +366,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
     stopTask,
     pauseTask,
     resumeTask,
+    retryTask,
   } = useDashboard(view)
   const [selected, setSelected] = useState<string[]>([])
   const [notice, setNotice] = useState('')
@@ -315,10 +380,16 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
   const [collectDialogOpen, setCollectDialogOpen] = useState(false)
   const [collectDialogMode, setCollectDialogMode] = useState<'collect' | 'full'>('collect')
   const [resumingTaskId, setResumingTaskId] = useState<string | null>(null)
+  // Keep terminal results visible until the user explicitly acknowledges them.
+  // Task snapshots are retained by the backend, but only tasks started from this
+  // page are surfaced as a completion prompt so old history does not interrupt a
+  // fresh session.
+  const [completionTaskIds, setCompletionTaskIds] = useState<string[]>([])
 
   const todayJobs = useMemo(
-    () => workbench.pending_confirmation.filter(job => !confirmedDeliveryIds.has(job.id)),
-    [workbench.pending_confirmation, confirmedDeliveryIds]
+    () => (workbench.today_pending_confirmation || workbench.pending_confirmation)
+      .filter(job => !confirmedDeliveryIds.has(job.id)),
+    [workbench.today_pending_confirmation, workbench.pending_confirmation, confirmedDeliveryIds]
   )
   const debouncedTodayQuery = useDebouncedValue(todayFilters.query, 250)
   const effectiveTodayFilters = useMemo(
@@ -346,14 +417,107 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
   }, [refresh])
 
   const pendingGreetingJobs = workbench.pending_greetings
-  const activeTask = workbench.task
+  const activeTasks = (workbench.active_tasks && workbench.active_tasks.length > 0)
+    ? workbench.active_tasks.filter(task => ['running', 'stopping', 'pausing'].includes(task.status))
+    : (workbench.task && ['running', 'stopping', 'pausing'].includes(workbench.task.status) ? [workbench.task] : [])
+  const pausedTasks = workbench.paused_tasks || []
+  const activeTask = activeTasks[0] || null
   const visibleTask = activeTask || workbench.last_task
   const pausedTask = !activeTask && visibleTask?.status === 'paused' ? visibleTask : null
   const visibleTaskError = visibleTask?.error ? taskErrorFeedback(visibleTask.error) : null
+  const durableScoringRuns = workbench.scoring_runs || []
+  const durableGreetingRuns = workbench.greeting_runs || []
+  const activeGreetingTask = activeTasks.find(task => task.mode === 'greet')
+    || pausedTasks.find(task => task.mode === 'greet')
+    || null
   const pendingReplies = history.filter(item => item.action === 'reply_pending')
+  const hasAdditionalPausedTasks = pausedTasks.some(task => task.id !== visibleTask?.id)
+
+  const taskSnapshots = useMemo(() => {
+    const byId = new Map<string, WorkbenchTask>()
+    for (const task of [
+      ...(workbench.tasks || []),
+      ...(workbench.active_tasks || []),
+      ...(workbench.paused_tasks || []),
+      workbench.task,
+      workbench.last_task,
+    ]) {
+      if (task) byId.set(task.id, task)
+    }
+    return byId
+  }, [workbench.tasks, workbench.active_tasks, workbench.paused_tasks, workbench.task, workbench.last_task])
+
+  const completionTask = useMemo(
+    () => completionTaskIds
+      .map(id => taskSnapshots.get(id))
+      .find(task => Boolean(task && COMPLETION_MODES.has(task.mode) && TERMINAL_TASK_STATUSES.has(task.status))) || null,
+    [completionTaskIds, taskSnapshots],
+  )
+
+  const trackCompletionTask = (task: WorkbenchTask | null | undefined) => {
+    if (!task || !COMPLETION_MODES.has(task.mode)) return
+    setCompletionTaskIds(previous => previous.includes(task.id) ? previous : [...previous, task.id])
+  }
+
+  const acknowledgeCompletion = () => {
+    if (!completionTask) return
+    setCompletionTaskIds(previous => previous.filter(id => id !== completionTask.id))
+  }
+
+  const retryCompletion = (task: WorkbenchTask) => {
+    setCompletionTaskIds(previous => previous.filter(id => id !== task.id))
+    void retryTask(task.id).then(() => setNotice('已重新尝试任务。')).catch(err => setNotice(err instanceof Error ? err.message : '重试失败'))
+  }
 
   const toggleJob = (id: string) => {
     setSelected(prev => (prev.includes(id) ? prev.filter(item => item !== id) : [...prev, id]))
+  }
+
+  const actOnScoringRun = async (run: ScoringRun, action: 'pause' | 'resume' | 'end') => {
+    try {
+      const res = await fetch(`/api/scoring/runs/${run.id}/${action}`, { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || '评分任务操作失败')
+      trackCompletionTask(taskSnapshot(data.task))
+      await refresh()
+      setNotice(action === 'end' ? '已结束评分任务，岗位池现在可以清空。' : action === 'pause' ? '已请求暂停评分，当前完成结果会保留。' : '已从断点继续评分。')
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '评分任务操作失败')
+    }
+  }
+
+  const actOnGreetingRun = async (run: GreetingRun, action: 'pause' | 'resume' | 'end') => {
+    try {
+      const res = await fetch(`/api/greeting/runs/${run.id}/${action}`, { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || '招呼语任务操作失败')
+      trackCompletionTask(taskSnapshot(data.task))
+      await refresh()
+      setNotice(action === 'resume' ? '已从招呼语断点继续。' : action === 'pause' ? '已请求暂停，已生成内容会保留。' : '已结束招呼语生成任务。')
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '招呼语任务操作失败')
+    }
+  }
+
+  const startTodayGreetings = async () => {
+    const jobIds = todayJobs.map(job => job.id)
+    if (!jobIds.length) {
+      setNotice('今天暂时没有待确认岗位可生成招呼语。')
+      return
+    }
+    if (!window.confirm(`将为今日待确认中的 ${jobIds.length} 个岗位生成招呼语，不会立即发送，是否继续？`)) return
+    setModePending('greet')
+    setNotice('单独生成招呼语启动前预检中...')
+    try {
+      if (!(await runPreflight('greet', { scope: 'today_pending', job_ids: jobIds }))) return
+      const task = await startTask('greet', { scope: 'today_pending', job_ids: jobIds })
+      trackCompletionTask(task)
+      setNotice(`已启动今日待确认岗位的招呼语生成，共 ${jobIds.length} 个岗位；完成后可单独投递。`)
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '启动招呼语生成失败')
+    } finally {
+      setModePending(null)
+    }
   }
 
   const runPreflight = async (mode: WorkbenchMode, options?: Record<string, unknown>) => {
@@ -376,25 +540,26 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
 
   const handleModeClick = async (mode: WorkbenchMode) => {
     try {
-      if (pausedTask) {
-        setNotice('当前有已暂停任务，请先点击“继续执行”或“停止”后再启动其他模式。')
-        return
-      }
-      if (activeTask?.mode === mode) {
-        if (window.confirm(`是否停止当前${activeTask.label}任务？已入库岗位会保留。`)) {
+      const sameModeTask = activeTasks.find(task => task.mode === mode)
+      let taskToStop = sameModeTask
+      if (activeTask?.mode === mode) taskToStop = activeTask
+      if (taskToStop) {
+        if (window.confirm(`是否停止当前${taskToStop.label}任务？已入库岗位会保留。`)) {
           setModePending(mode)
-          setNotice(`正在停止${activeTask.label}...`)
-          await stopTask(activeTask.id)
-          setNotice(`${activeTask.label}已请求停止。`)
+          setNotice(`正在停止${taskToStop.label}...`)
+          const task = await stopTask(taskToStop.id)
+          trackCompletionTask(task)
+          setNotice(`${taskToStop.label}已请求停止。`)
         }
         return
       }
       if (modePending) return
-      if (activeTask) {
+      const conflictingTask = activeTasks.find(task => modesConflict(mode, task))
+      if (conflictingTask) {
         setNotice(
-          activeTask.status === 'stopping'
-            ? `当前${activeTask.label}正在停止，请等待后台完全结束后再启动其他模式。`
-            : `当前正在运行${activeTask.label}，请先点击橙色卡片停止后再启动其他模式。`
+          conflictingTask.status === 'stopping'
+            ? `当前${conflictingTask.label}正在停止，请等待后台完全结束后再启动冲突模式。`
+            : `当前${conflictingTask.label}占用相同运行资源；可同时运行 AI 评分、招呼语生成等独立任务。`
         )
         return
       }
@@ -403,12 +568,17 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
         setCollectDialogOpen(true)
         return
       }
+      if (mode === 'greet') {
+        await startTodayGreetings()
+        return
+      }
       const target = modes.find(item => item.mode === mode)
       setModePending(mode)
       setNotice(`${target?.title || '任务'}启动前预检中...`)
       if (!(await runPreflight(mode))) return
       setNotice(`${target?.title || '任务'}启动中，请稍候...`)
-      await startTask(mode)
+      const task = await startTask(mode)
+      trackCompletionTask(task)
       setNotice(`${target?.title || '任务'}已启动，日志会在下方更新。`)
     } catch (err) {
       setNotice(err instanceof Error ? err.message : '操作失败')
@@ -434,17 +604,21 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
   const startCollection = async (options: Record<string, unknown>) => {
     const mode = collectDialogMode
     setModePending(mode)
-    setNotice(mode === 'full' ? '全流程启动前预检中...' : '岗位采集启动前预检中...')
+    setNotice(mode === 'full' ? '全流程启动前预检中...' : mode === 'collect' ? '岗位采集启动前预检中...' : `${modes.find(item => item.mode === mode)?.title || '任务'}启动前预检中...`)
     try {
       if (!(await runPreflight(mode, options))) return
       if (resumingTaskId) {
-        await resumeTask(resumingTaskId, options)
+        const task = await resumeTask(resumingTaskId, options)
+        trackCompletionTask(task)
         setResumingTaskId(null)
       } else {
-        await startTask(mode, options)
+        const task = await startTask(mode, options)
+        trackCompletionTask(task)
       }
+      // Keep the completion prompt independent from the setup dialog. The
+      // setup closes after launch, and the result remains until confirmation.
       setCollectDialogOpen(false)
-      setNotice(resumingTaskId ? '已按新的设置从断点继续执行。' : mode === 'full' ? '全流程已启动，进度会在下方更新。' : '岗位采集已启动，进度会在下方更新。')
+      setNotice(resumingTaskId ? '已按新的设置从断点继续执行。' : mode === 'full' ? '全流程已启动，进度会在下方更新。' : mode === 'collect' ? '岗位采集已启动，进度会在下方更新。' : `${modes.find(item => item.mode === mode)?.title || '任务'}已启动，进度会在下方更新。`)
     } catch (err) {
       setNotice(err instanceof Error ? err.message : '岗位采集启动失败')
     } finally {
@@ -467,6 +641,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
         throw new Error(data.error || '投递失败')
       }
       const data = await res.json().catch(() => ({}))
+      trackCompletionTask(taskSnapshot(data))
       if (!ids.some(id => workbench.send_errors.some(job => job.id === id))) {
         setConfirmedDeliveryIds(prev => new Set([...prev, ...ids]))
       }
@@ -522,6 +697,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
         throw new Error(data.error || '发送失败')
       }
       const data = await res.json().catch(() => ({}))
+      trackCompletionTask(taskSnapshot(data))
       await refresh()
       setNotice(
         data.already_queued_count === count
@@ -596,16 +772,63 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
               )}
             </div>
             <span className="rounded-full bg-[#FFF0E5] px-3 py-2 text-xs font-black text-primary">
-              {activeTask ? `${activeTask.label}中` : '当前空闲'}
+              {activeTasks.length ? `${activeTasks.length} 个任务运行中` : pausedTasks.length ? `${pausedTasks.length} 个任务已暂停` : '当前空闲'}
             </span>
           </div>
         </div>
 
+        {durableScoringRuns.length > 0 && (
+          <div className="mb-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+            {durableScoringRuns.slice(0, 1).map(run => (
+              <div key={run.id} className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="font-black">{run.status === 'paused' ? '评分任务已暂停，可继续' : '评分任务仍在运行'}</div>
+                  <div className="mt-1 text-xs">剩余 {run.remaining_job_ids.length} 个岗位。清空岗位池前请先结束或继续该任务。</div>
+                  {run.pause_reason && <div className="mt-1 text-xs">原因：{run.pause_reason}</div>}
+                  <ScoringProgressPanel progress={run.progress} status={run.status} />
+                </div>
+                <div className="flex gap-2">
+                  {run.status === 'running' && <Button variant="secondary" size="sm" onClick={() => void actOnScoringRun(run, 'pause')}><Pause className="mr-1 h-4 w-4" />暂停评分</Button>}
+                  {run.status === 'paused' && run.recoverable && <Button size="sm" onClick={() => void actOnScoringRun(run, 'resume')}><Play className="mr-1 h-4 w-4" />继续评分</Button>}
+                  <Button size="sm" variant="secondary" onClick={() => void actOnScoringRun(run, 'end')}><Square className="mr-1 h-4 w-4" />结束评分</Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {durableGreetingRuns.length > 0 && (
+          <div className="mb-4 rounded-2xl border border-primary/20 bg-[#FFF0E5] px-4 py-3 text-sm text-primary">
+            {durableGreetingRuns.slice(0, 1).map(run => (
+              <div key={run.id} className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="font-black">{run.status === 'paused' ? '招呼语生成已暂停，可继续' : '招呼语生成进行中'}</div>
+                  <div className="mt-1 text-xs">剩余 {run.remaining_job_ids.length} 个岗位；已生成内容已保存，可从断点继续。</div>
+                  {run.pause_reason && <div className="mt-1 text-xs">原因：{run.pause_reason}</div>}
+                  <GreetingProgressPanel
+                    progress={greetingProgressFromTask(activeGreetingTask) || run.progress}
+                    status={activeGreetingTask?.status || run.status}
+                  />
+                </div>
+                <div className="flex gap-2">
+                  {run.status === 'running' && <Button variant="secondary" size="sm" onClick={() => void actOnGreetingRun(run, 'pause')}><Pause className="mr-1 h-4 w-4" />暂停</Button>}
+                  {run.status === 'paused' && run.recoverable && <Button size="sm" onClick={() => void actOnGreetingRun(run, 'resume')}><Play className="mr-1 h-4 w-4" />继续生成</Button>}
+                  <Button size="sm" variant="secondary" onClick={() => void actOnGreetingRun(run, 'end')}><Square className="mr-1 h-4 w-4" />停止</Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
 
         <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
           {modes.map(item => {
-            const isActive = activeTask?.mode === item.mode
-            const disabled = Boolean((activeTask && !isActive) || pausedTask)
+            const runningTask = activeTasks.find(task => task.mode === item.mode)
+            const isActive = Boolean(runningTask)
+            const durableScoreConflict = item.mode === 'score' && durableScoringRuns.length > 0
+            const durableGreetingConflict = item.mode === 'greet' && durableGreetingRuns.length > 0
+            const noGreetingTargets = item.mode === 'greet' && todayJobs.length === 0
+            const disabled = Boolean(!isActive && (noGreetingTargets || durableScoreConflict || durableGreetingConflict || activeTasks.some(task => modesConflict(item.mode, task))))
             return (
               <button
                 key={item.mode}
@@ -615,7 +838,14 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
                     return
                   }
                   if (disabled) {
-                    setNotice(`当前正在运行${activeTask?.label || '其他任务'}，请先停止后再启动岗位采集。`)
+                    const conflict = activeTasks.find(task => modesConflict(item.mode, task))
+                    setNotice(noGreetingTargets
+                      ? '今天暂时没有待确认岗位可生成招呼语。'
+                      : durableScoreConflict
+                      ? '已有独立评分任务正在运行或等待恢复，请先在提示卡片中继续或结束它。'
+                      : durableGreetingConflict
+                        ? '已有招呼语生成任务正在运行或等待恢复，请先在提示卡片中继续或结束它。'
+                      : `当前正在运行${conflict?.label || '冲突任务'}，该模式暂不能启动；AI 评分和招呼语可与采集并行。`)
                     return
                   }
                   if (item.mode === 'collect' || item.mode === 'full') {
@@ -641,12 +871,66 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
                   </div>
                   {isActive ? <Square className="h-5 w-5 fill-current" /> : <Play className="h-5 w-5" />}
                 </div>
-                <p className={`text-xs leading-6 ${isActive ? 'text-white/85' : 'text-muted'}`}>{item.description}</p>
+                <p className={`text-xs leading-6 ${isActive ? 'text-white/85' : 'text-muted'}`}>
+                  {item.description}
+                  {item.mode === 'greet' && ` 当前 ${todayJobs.length} 个今日待确认岗位`}
+                </p>
               </button>
             )
           })}
         </div>
         {notice && <div className="mt-3 rounded-2xl bg-[#FFF0E5] px-4 py-3 text-sm text-primary">{notice}</div>}
+        {(activeTasks.length > 1 || (activeTasks.length > 0 && pausedTasks.length > 0) || hasAdditionalPausedTasks) && (
+          <div className="mt-3 rounded-3xl border border-primary/20 bg-[#FFFCFA] p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div className="text-sm font-black">并行任务</div>
+                <p className="mt-1 text-xs text-muted">互不冲突的 AI、采集和本地处理任务可以同时运行；投递与监测仍共用浏览器安全通道。暂停的任务会保留断点。</p>
+              </div>
+              <span className="rounded-full bg-[#FFF0E5] px-3 py-1 text-xs font-black text-primary">
+                {activeTasks.length} 个运行中{pausedTasks.length ? ` · ${pausedTasks.length} 个已暂停` : ''}
+              </span>
+            </div>
+            <div className="mt-3 grid gap-2 md:grid-cols-2">
+              {activeTasks.filter(task => task.id !== activeTask?.id).map(task => (
+                <div key={task.id} className="rounded-2xl border border-card-border bg-white px-3 py-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="text-sm font-black">{task.label}</div>
+                      <div className="mt-1 text-xs text-muted">{taskStatusText(task.status)} · {task.logs?.[task.logs.length - 1] || '后台处理中'}</div>
+                    </div>
+                    <div className="flex gap-1">
+                      {task.status === 'running' && <Button variant="secondary" size="sm" onClick={() => void pauseTask(task.id).then(() => setNotice(`已请求暂停${task.label}。`)).catch(err => setNotice(err instanceof Error ? err.message : '暂停失败'))}>暂停</Button>}
+                      {(task.status === 'running' || task.status === 'pausing' || task.status === 'paused') && <Button variant="ghost" size="sm" onClick={() => void stopTask(task.id).then(() => setNotice(`已请求停止${task.label}。`)).catch(err => setNotice(err instanceof Error ? err.message : '停止失败'))}>停止</Button>}
+                    </div>
+                  </div>
+                </div>
+              ))}
+              {pausedTasks.filter(task => task.id !== visibleTask?.id).map(task => (
+                <div key={task.id} className="rounded-2xl border border-amber-200 bg-amber-50 px-3 py-3">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="text-sm font-black">{task.label}</div>
+                      <div className="mt-1 text-xs text-amber-800">已暂停 · {task.stop_reason || '可从断点继续'}</div>
+                    </div>
+                    <div className="flex gap-1">
+                      <Button size="sm" onClick={() => {
+                        if (task.mode === 'collect' || task.mode === 'full') {
+                          setResumingTaskId(task.id)
+                          setCollectDialogMode(task.mode)
+                          setCollectDialogOpen(true)
+                          return
+                        }
+                        void resumeTask(task.id).then(resumed => { trackCompletionTask(resumed); setNotice(`已从断点继续${task.label}。`) }).catch(err => setNotice(err instanceof Error ? err.message : '继续执行失败'))
+                      }}><Play className="mr-1 h-4 w-4" />继续</Button>
+                      <Button variant="ghost" size="sm" onClick={() => void stopTask(task.id).then(() => setNotice(`已停止${task.label}。`)).catch(err => setNotice(err instanceof Error ? err.message : '停止失败'))}>停止</Button>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
         {preflightChecks.some(check => check.status !== 'pass') && (
           <PreflightPanel checks={preflightChecks} checking={Boolean(modePending)} onRetry={retryPreflight} />
         )}
@@ -669,7 +953,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
                   <div className="mt-1 text-lg font-black text-foreground">{currentTaskStage(visibleTask.logs)}</div>
                   <div className="mt-1 text-xs font-bold text-muted">任务状态：{taskStatusText(visibleTask.status)}</div>
                   {visibleTask.checkpoint?.stage && (
-                    <div className="mt-1 text-xs text-muted">断点：{String(visibleTask.checkpoint.stage)}</div>
+                    <div className="mt-1 text-xs text-muted">断点：{checkpointLabel(visibleTask.checkpoint.stage)}</div>
                   )}
                 </div>
                 <div className="flex flex-wrap gap-2">
@@ -688,7 +972,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
                         setCollectDialogOpen(true)
                         return
                       }
-                      void resumeTask(visibleTask.id).then(() => setNotice('已从断点继续执行。')).catch(err => setNotice(err instanceof Error ? err.message : '继续执行失败'))
+                      void resumeTask(visibleTask.id).then(resumed => { trackCompletionTask(resumed); setNotice('已从断点继续执行。') }).catch(err => setNotice(err instanceof Error ? err.message : '继续执行失败'))
                     }}>
                       <Play className="mr-2 h-4 w-4" />继续执行
                     </Button>
@@ -717,6 +1001,21 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
                   ))}
                 </div>
               )}
+              {visibleTask.send_progress && (
+                <SendProgressPanel
+                  progress={visibleTask.send_progress}
+                  status={visibleTask.status}
+                />
+              )}
+              {visibleTask.mode === 'greet' && (
+                <GreetingProgressPanel
+                  progress={greetingProgressFromTask(visibleTask)}
+                  status={visibleTask.status}
+                />
+              )}
+              {visibleTask.mode === 'score' || visibleTask.mode === 'rescore' ? (
+                <ScoringProgressPanel progress={visibleTask.scoring_progress} status={visibleTask.status} />
+              ) : null}
             </div>
             {visibleTask.progress?.platforms && <CollectionProgressPanel progress={visibleTask.progress} />}
             {visibleTask.error && visibleTaskError && (
@@ -847,7 +1146,7 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
               <p className="mt-1 text-xs text-danger/80">这些岗位已生成招呼语，但没有成功发送。你可以重试，或放弃已失效岗位。</p>
             </div>
             <div className="flex flex-wrap gap-2">
-              <Button size="sm" onClick={() => confirmDeliver(workbench.send_errors.map(job => job.id))}>重新发送全部 {workbench.send_errors.length} 个</Button>
+              <Button size="sm" onClick={() => sendReadyGreetings(workbench.send_errors.map(job => job.id))}>重新发送全部 {workbench.send_errors.length} 个</Button>
               <Button variant="secondary" size="sm" onClick={() => rejectSelectedJobs(workbench.send_errors.map(job => job.id))}>放弃全部</Button>
             </div>
           </div>
@@ -916,6 +1215,15 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
             <p className="mt-1 text-xs text-muted">展示需要你人工确认是否推进投递的岗位，支持全选、部分选择、一键投递。</p>
           </div>
           <div className="flex gap-2">
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={() => void startTodayGreetings()}
+              disabled={!todayJobs.length || Boolean(activeGreetingTask || durableGreetingRuns.length) || modePending === 'greet'}
+            >
+              <MessageCircle className="mr-1 h-4 w-4" />
+              {activeGreetingTask || durableGreetingRuns.length ? '招呼语生成中…' : `生成今日招呼语 ${todayJobs.length} 个`}
+            </Button>
             <Button variant="secondary" size="sm" onClick={() => setSelected(filteredTodayJobs.map(job => job.id))}>全选</Button>
             <Button variant="secondary" size="sm" onClick={() => setSelected([])}>清空</Button>
             <Button variant="secondary" size="sm" onClick={() => rejectSelectedJobs(actionableSelected)}>放弃已选 {actionableSelected.length} 个</Button>
@@ -957,10 +1265,11 @@ export default function DashboardPage({ view = 'workbench' }: DashboardPageProps
       <CollectJobsDialog
         open={collectDialogOpen}
         mode={collectDialogMode}
-        activeTask={activeTask && (activeTask.mode === 'collect' || activeTask.mode === 'full') ? activeTask : null}
+        activeTask={activeTasks.find(task => task.mode === 'collect' || task.mode === 'full') || null}
         onClose={() => { setCollectDialogOpen(false); setResumingTaskId(null) }}
         onStart={options => void startCollection(options)}
       />
+      <TaskCompletionDialog task={completionTask} onConfirm={acknowledgeCompletion} onRetry={retryCompletion} />
     </div>
   )
 }
@@ -986,6 +1295,138 @@ function CollectionProgressPanel({ progress }: { progress: CollectionProgress })
             {(state.message || state.reason_code) && <div className="mt-1 text-xs font-bold text-primary">{state.message || state.reason_code}</div>}
           </div>
         ))}
+      </div>
+    </div>
+  )
+}
+
+function SendProgressPanel({
+  progress,
+  status = 'running',
+}: {
+  progress: SendProgress
+  status?: string
+}) {
+  const total = Math.max(Number(progress.total || 0), 0)
+  const attempted = Math.min(Math.max(Number(progress.attempted || 0), 0), total || Number(progress.attempted || 0))
+  const sent = Math.max(Number(progress.sent || 0), 0)
+  const failed = Math.max(Number(progress.failed || 0), 0)
+  const deferred = Math.max(Number(progress.deferred || 0), 0)
+  const percent = total > 0 ? Math.min(100, Math.round((attempted / total) * 100)) : 0
+  const currentJob = progress.current_job
+  const isFinished = attempted >= total && total > 0
+  const stateLabel = status === 'paused' ? '已暂停'
+    : status === 'stopped' || status === 'error' || status === 'failed' ? '已停止'
+      : isFinished || status === 'completed' ? '已完成本轮' : '投递中'
+  return (
+    <div className="mt-3 rounded-2xl border border-emerald-200 bg-emerald-50 p-4 text-emerald-950">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-sm font-black">招呼语投递进度</div>
+        <div className="text-xs font-black">共 {total} 个公司 · 已投递 {sent} 个</div>
+      </div>
+      <div className="mt-2 h-2 overflow-hidden rounded-full bg-emerald-100" role="progressbar" aria-label="招呼语投递进度" aria-valuemin={0} aria-valuemax={total || 1} aria-valuenow={attempted}>
+        <div className="h-full rounded-full bg-emerald-600 transition-[width] duration-200" style={{ width: `${percent}%` }} />
+      </div>
+      <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs font-bold text-emerald-800">
+        <span>已处理 {attempted}/{total || '—'}{failed ? ` · 失败 ${failed} 个` : ''}</span>
+        <span>{stateLabel}</span>
+      </div>
+      {deferred > 0 && (
+        <div className="mt-1 text-xs text-emerald-800">另有 {deferred} 个因今日发送额度本轮暂不执行</div>
+      )}
+      {currentJob ? (
+        <div className="mt-2 rounded-xl border border-emerald-200 bg-white px-3 py-2">
+          <div className="text-[10px] font-black text-emerald-700">正在投递</div>
+          <div className="mt-0.5 truncate text-sm font-black text-foreground">{currentJob.company}｜{currentJob.title}</div>
+        </div>
+      ) : status === 'running' && !isFinished ? (
+        <div className="mt-2 rounded-xl bg-white/70 px-3 py-2 text-xs text-emerald-800">正在准备下一家公司…</div>
+      ) : null}
+    </div>
+  )
+}
+
+function greetingProgressFromTask(task: WorkbenchTask | null | undefined): GreetingProgress | null {
+  if (!task) return null
+  if (task.greeting_progress) return task.greeting_progress
+  const metrics = task.metrics || {}
+  if (!('greeting_total' in metrics) && !('greeting_generated' in metrics)) return null
+  return {
+    completed: Number(metrics.greeting_completed || 0),
+    total: Number(metrics.greeting_total || metrics.greeting_requested || 0),
+    generated: Number(metrics.greeting_generated || 0),
+    failed: Number(metrics.greeting_failed || 0),
+    current_job: task.current_job || null,
+  }
+}
+
+function GreetingProgressPanel({
+  progress,
+  status = 'running',
+}: {
+  progress?: GreetingProgress | null
+  status?: string
+}) {
+  if (!progress) return null
+  const total = Math.max(Number(progress.total || progress.selected || 0), 0)
+  const generated = Math.max(Number(progress.generated || 0), 0)
+  const completed = Math.max(Number(progress.completed || 0), generated)
+  const failed = Math.max(Number(progress.failed || 0), 0)
+  const percent = total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0
+  const currentJob = progress.current_job
+  return (
+    <div className="mt-3 rounded-2xl border border-primary/20 bg-white p-3 text-primary">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-sm font-black">招呼语生成进度</div>
+        <div className="text-xs font-black">共 {total} 个 · 已生成 {generated} 个</div>
+      </div>
+      <div className="mt-2 h-2 overflow-hidden rounded-full bg-[#FFF0E5]" role="progressbar" aria-label="招呼语生成进度" aria-valuemin={0} aria-valuemax={total || 1} aria-valuenow={Math.min(completed, total || completed)}>
+        <div className="h-full rounded-full bg-primary transition-[width] duration-200" style={{ width: `${percent}%` }} />
+      </div>
+      <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-xs text-muted">
+        <span>已处理 {completed}/{total || '—'} 个{failed ? ` · 失败 ${failed} 个` : ''}</span>
+        <span>{status === 'paused' ? '已暂停' : status === 'completed' ? '已完成' : '生成中'}</span>
+      </div>
+      {currentJob ? (
+        <div className="mt-2 rounded-xl border border-primary/20 bg-[#FFFCFA] px-3 py-2">
+          <div className="text-[10px] font-black text-primary">正在生成</div>
+          <div className="mt-0.5 truncate text-sm font-black text-foreground">{currentJob.company}｜{currentJob.title}</div>
+        </div>
+      ) : status === 'running' && completed < total ? (
+        <div className="mt-2 rounded-xl bg-[#FFFCFA] px-3 py-2 text-xs text-muted">正在准备下一个岗位…</div>
+      ) : null}
+    </div>
+  )
+}
+
+function ScoringProgressPanel({ progress, status = 'running' }: { progress?: ScoringProgress; status?: string }) {
+  if (!progress) return null
+  const total = Math.max(Number(progress.total || 0), 0)
+  const completed = Math.max(Number(progress.completed || 0), 0)
+  const percent = total > 0 ? Math.min(100, Math.round((completed / total) * 100)) : 0
+  const activeJobs = Array.isArray(progress.active_jobs) ? progress.active_jobs : []
+  return (
+    <div className="mt-3 rounded-2xl border border-sky-200 bg-sky-50 p-4 text-sky-950">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-sm font-black">AI 评分并行状态</div>
+        <div className="text-xs font-black">{activeJobs.length} 个评分工作者 · 已处理 {completed}/{total || '—'}</div>
+      </div>
+      <div className="mt-2 h-2 overflow-hidden rounded-full bg-sky-100" role="progressbar" aria-label="AI 评分进度" aria-valuemin={0} aria-valuemax={total || 1} aria-valuenow={Math.min(completed, total || completed)}>
+        <div className="h-full rounded-full bg-sky-600 transition-[width] duration-200" style={{ width: `${percent}%` }} />
+      </div>
+      <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-xs text-sky-800">
+        <span>通过 {progress.scored || 0}</span><span>过滤 {progress.filtered || 0}</span><span>失败 {progress.failed || 0}</span>
+        <span>{status === 'paused' ? '已暂停' : status === 'completed' ? '已完成' : '评分中'}</span>
+      </div>
+      <div className="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
+        {activeJobs.length ? activeJobs.map(job => (
+          <div key={job.id} className="rounded-xl border border-sky-200 bg-white px-3 py-2">
+            <div className="text-[10px] font-black text-sky-700">正在评分</div>
+            <div className="mt-0.5 truncate text-sm font-black text-foreground">{job.company}｜{job.title}</div>
+          </div>
+        )) : (
+          <div className="rounded-xl bg-white/70 px-3 py-2 text-xs text-sky-800">正在准备评分岗位…</div>
+        )}
       </div>
     </div>
   )
@@ -1073,14 +1514,123 @@ function JobsPoolView() {
   const [recycleLoading, setRecycleLoading] = useState(false)
   const [permanentDeleteIds, setPermanentDeleteIds] = useState<string[]>([])
   const [permanentDeleteAcknowledged, setPermanentDeleteAcknowledged] = useState(false)
+  const [greetingLoading, setGreetingLoading] = useState(false)
+  const [completionTaskIds, setCompletionTaskIds] = useState<string[]>([])
   const [clearPoolLoading, setClearPoolLoading] = useState(false)
   const [selectAllLoading, setSelectAllLoading] = useState(false)
   const [clearSelectedLoading, setClearSelectedLoading] = useState(false)
   const { items, total, allTotal, loading, error, refresh: refreshJobs } = useJobSearch(filters, page, pageSize, sortBy, sortOrder)
-  const { workbench: deliveryWorkbench } = useDashboard('workbench')
-  const deliveryTask = deliveryWorkbench.task?.mode === 'deliver'
-    ? deliveryWorkbench.task
-    : deliveryWorkbench.last_task?.mode === 'deliver' ? deliveryWorkbench.last_task : null
+  const {
+    workbench: deliveryWorkbench,
+    refresh: refreshWorkbench,
+    startTask,
+    stopTask,
+    pauseTask,
+    resumeTask,
+    retryTask,
+  } = useDashboard('workbench')
+  const deliveryTask = deliveryWorkbench.active_tasks?.find(task => task.mode === 'deliver')
+    || (deliveryWorkbench.task?.mode === 'deliver' ? deliveryWorkbench.task : null)
+    || (deliveryWorkbench.last_task?.mode === 'deliver' ? deliveryWorkbench.last_task : null)
+  const scoringRun = deliveryWorkbench.scoring_runs?.[0]
+  const greetingRun = deliveryWorkbench.greeting_runs?.[0]
+  const greetingTask = deliveryWorkbench.active_tasks?.find(task => task.mode === 'greet')
+    || deliveryWorkbench.paused_tasks?.find(task => task.mode === 'greet')
+    || (deliveryWorkbench.last_task?.mode === 'greet' && ['running', 'stopping', 'pausing', 'paused'].includes(deliveryWorkbench.last_task.status) ? deliveryWorkbench.last_task : null)
+  const greetingRemaining = greetingRun
+    ? greetingRun.remaining_job_ids.length
+    : Array.isArray(greetingTask?.checkpoint?.remaining_job_ids)
+      ? greetingTask.checkpoint.remaining_job_ids.length
+      : null
+  const todayGreetingIds = useMemo(
+    () => new Set((deliveryWorkbench.today_pending_confirmation || deliveryWorkbench.pending_confirmation || []).map(job => job.id)),
+    [deliveryWorkbench.today_pending_confirmation, deliveryWorkbench.pending_confirmation],
+  )
+  const selectedTodayGreetingIds = useMemo(
+    () => selectedIds.filter(id => todayGreetingIds.has(id)),
+    [selectedIds, todayGreetingIds],
+  )
+
+  const taskSnapshots = useMemo(() => {
+    const byId = new Map<string, WorkbenchTask>()
+    for (const task of [
+      ...(deliveryWorkbench.tasks || []),
+      ...(deliveryWorkbench.active_tasks || []),
+      ...(deliveryWorkbench.paused_tasks || []),
+      deliveryWorkbench.task,
+      deliveryWorkbench.last_task,
+    ]) {
+      if (task) byId.set(task.id, task)
+    }
+    return byId
+  }, [deliveryWorkbench.tasks, deliveryWorkbench.active_tasks, deliveryWorkbench.paused_tasks, deliveryWorkbench.task, deliveryWorkbench.last_task])
+
+  const completionTask = useMemo(
+    () => completionTaskIds
+      .map(id => taskSnapshots.get(id))
+      .find(task => Boolean(task && COMPLETION_MODES.has(task.mode) && TERMINAL_TASK_STATUSES.has(task.status))) || null,
+    [completionTaskIds, taskSnapshots],
+  )
+
+  const trackCompletionTask = (task: WorkbenchTask | null | undefined) => {
+    if (!task || !COMPLETION_MODES.has(task.mode)) return
+    setCompletionTaskIds(previous => previous.includes(task.id) ? previous : [...previous, task.id])
+  }
+
+  const acknowledgeCompletion = () => {
+    if (!completionTask) return
+    if (completionTask.mode === 'score' || completionTask.mode === 'rescore') setShowScoreDialog(false)
+    setCompletionTaskIds(previous => previous.filter(id => id !== completionTask.id))
+  }
+
+  const retryCompletion = (task: WorkbenchTask) => {
+    setCompletionTaskIds(previous => previous.filter(id => id !== task.id))
+    void retryTask(task.id).then(() => setNotice('已重新尝试任务。')).catch(err => setNotice(err instanceof Error ? err.message : '重试失败'))
+  }
+
+  const endScoringRun = async () => {
+    if (!scoringRun) return
+    try {
+      const res = await fetch(`/api/scoring/runs/${scoringRun.id}/end`, { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || '结束评分任务失败')
+      await refreshWorkbench()
+      setNotice('已结束评分任务，岗位池现在可以清空。')
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '结束评分任务失败')
+    }
+  }
+
+  const actOnGreetingTask = async (action: 'pause' | 'resume' | 'stop') => {
+    if (!greetingTask) return
+    try {
+      const task = action === 'pause'
+        ? await pauseTask(greetingTask.id)
+        : action === 'resume'
+          ? await resumeTask(greetingTask.id)
+          : await stopTask(greetingTask.id)
+      trackCompletionTask(task)
+      await refreshWorkbench()
+      setNotice(action === 'pause' ? '已请求暂停招呼语生成，正在保存断点。' : action === 'resume' ? '已从招呼语断点继续。' : '已停止招呼语生成任务。')
+      return task
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '招呼语任务操作失败')
+      return null
+    }
+  }
+
+  const actOnGreetingRun = async (action: 'pause' | 'resume' | 'end') => {
+    if (!greetingRun) return
+    try {
+      const res = await fetch(`/api/greeting/runs/${greetingRun.id}/${action}`, { method: 'POST' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.error || '招呼语任务操作失败')
+      await refreshWorkbench()
+      setNotice(action === 'pause' ? '已请求暂停招呼语生成。' : action === 'resume' ? '已从剩余岗位继续生成招呼语。' : '已结束招呼语生成任务。')
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : '招呼语任务操作失败')
+    }
+  }
 
   useEffect(() => {
     setPage(0)
@@ -1286,6 +1836,7 @@ function JobsPoolView() {
     if (!window.confirm(`确认投递已选择的 ${count} 个岗位吗？仅 BOSS 岗位可进入发送队列，且仍受发送时间窗口和每日额度限制。`)) return
     try {
       const result = await postJobAction('/api/workbench/deliver', { job_ids: selectedIds })
+      trackCompletionTask(taskSnapshot(result))
       setSelectedIds([])
       refreshJobs()
       setNotice(
@@ -1393,6 +1944,7 @@ function JobsPoolView() {
       const checks = Array.isArray(data.messages) ? data.messages.join('；') : ''
       throw new Error([data.error || '启动评分失败', checks].filter(Boolean).join('：'))
     }
+    trackCompletionTask(taskSnapshot(data.task))
     setNotice(`独立评分已启动，共 ${data.run?.remaining_job_ids?.length || 0} 个岗位。`)
   }
 
@@ -1405,6 +1957,24 @@ function JobsPoolView() {
       setNotice(cause instanceof Error ? cause.message : '启动 AI 评分失败')
     } finally {
       setQuickScoring(false)
+    }
+  }
+
+  const startSelectedGreetings = async () => {
+    if (!selectedTodayGreetingIds.length) {
+      setNotice('单独生成招呼语只能处理“今日待确认”中的岗位，请先选择今日岗位。')
+      return
+    }
+    if (!window.confirm(`将为今日待确认中的 ${selectedTodayGreetingIds.length} 个岗位生成招呼语，不会立即发送，是否继续？`)) return
+    setGreetingLoading(true)
+    try {
+      const task = await startTask('greet', { scope: 'today_pending', job_ids: selectedTodayGreetingIds })
+      trackCompletionTask(task)
+      setNotice(`已启动今日待确认岗位的招呼语生成，共 ${selectedTodayGreetingIds.length} 个岗位；完成后可单独投递。`)
+    } catch (cause) {
+      setNotice(cause instanceof Error ? cause.message : '启动招呼语生成失败')
+    } finally {
+      setGreetingLoading(false)
     }
   }
 
@@ -1481,10 +2051,65 @@ function JobsPoolView() {
         <Button size="sm" onClick={() => void startQuickScoring()} disabled={quickScoring || !total}>
           {quickScoring ? '启动评分中…' : '一键 AI 评分'}
         </Button>
+        <Button variant="secondary" size="sm" onClick={() => void startSelectedGreetings()} disabled={greetingLoading || !selectedTodayGreetingIds.length}>
+          {greetingLoading ? '生成中…' : '生成已选今日招呼语'}
+        </Button>
         <Button variant="secondary" size="sm" onClick={() => setShowScoreDialog(true)}>评分选项</Button>
         <ExportMenu onExport={exportJobs} hasSelection={selectedIds.length > 0} hasFiltered={total > 0} />
       </div>
       {notice && <div className="mb-4 rounded-xl bg-[#FFF0E5] px-4 py-3 text-sm text-primary">{notice}</div>}
+      {scoringRun && (
+        <div className="mb-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="font-black">{scoringRun.status === 'paused' ? '评分任务已暂停，可继续' : '评分任务仍在运行'}</div>
+              <div className="mt-1 text-xs">剩余 {scoringRun.remaining_job_ids.length} 个岗位。清空岗位池前请先结束该任务。</div>
+            </div>
+            <div className="flex gap-2">
+              {scoringRun.status === 'paused' && scoringRun.recoverable && (
+                <Button size="sm" onClick={() => void fetch(`/api/scoring/runs/${scoringRun.id}/resume`, { method: 'POST' }).then(async response => {
+                  const data = await response.json().catch(() => ({}))
+                  if (!response.ok) throw new Error(data.error || '继续评分失败')
+                  trackCompletionTask(taskSnapshot(data.task))
+                  await refreshWorkbench()
+                  setNotice('已从评分断点继续。')
+                }).catch(err => setNotice(err instanceof Error ? err.message : '继续评分失败'))}><Play className="mr-1 h-4 w-4" />继续评分</Button>
+              )}
+              {scoringRun.status === 'running' && (
+                <Button size="sm" variant="secondary" onClick={() => void fetch(`/api/scoring/runs/${scoringRun.id}/pause`, { method: 'POST' }).then(async response => {
+                  const data = await response.json().catch(() => ({}))
+                  if (!response.ok) throw new Error(data.error || '暂停评分失败')
+                  await refreshWorkbench()
+                  setNotice('已请求暂停评分，当前完成结果会保留。')
+                }).catch(err => setNotice(err instanceof Error ? err.message : '暂停评分失败'))}><Pause className="mr-1 h-4 w-4" />暂停</Button>
+              )}
+              <Button size="sm" variant="secondary" onClick={() => void endScoringRun()}><Square className="mr-1 h-4 w-4" />结束评分</Button>
+            </div>
+          </div>
+        </div>
+      )}
+      {(greetingRun || greetingTask) && (
+        <div className="mb-4 rounded-2xl border border-primary/20 bg-[#FFF0E5] px-4 py-3 text-sm text-primary">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <div className="font-black">{greetingRun?.status === 'paused' || greetingTask?.status === 'paused' ? '招呼语生成已暂停，可继续' : '招呼语生成进行中'}</div>
+              <div className="mt-1 text-xs">剩余 {greetingRemaining ?? '—'} 个岗位；已生成内容会保留。</div>
+              {(greetingRun?.pause_reason || greetingTask?.stop_reason) && <div className="mt-1 text-xs">原因：{greetingRun?.pause_reason || greetingTask?.stop_reason}</div>}
+              <GreetingProgressPanel
+                progress={greetingProgressFromTask(greetingTask) || greetingRun?.progress}
+                status={greetingTask?.status || greetingRun?.status}
+              />
+            </div>
+            <div className="flex gap-2">
+              {greetingRun?.status === 'running' && <Button size="sm" variant="secondary" onClick={() => void actOnGreetingRun('pause')}><Pause className="mr-1 h-4 w-4" />暂停</Button>}
+              {greetingRun?.status === 'paused' && greetingRun.recoverable && <Button size="sm" onClick={() => void actOnGreetingRun('resume')}><Play className="mr-1 h-4 w-4" />继续生成</Button>}
+              {!greetingRun && greetingTask?.status === 'running' && <Button size="sm" variant="secondary" onClick={() => void actOnGreetingTask('pause')}><Pause className="mr-1 h-4 w-4" />暂停</Button>}
+              {!greetingRun && greetingTask?.status === 'paused' && <Button size="sm" onClick={() => void actOnGreetingTask('resume')}><Play className="mr-1 h-4 w-4" />继续生成</Button>}
+              {(greetingRun || greetingTask) && <Button size="sm" variant="secondary" onClick={() => greetingRun ? void actOnGreetingRun('end') : void actOnGreetingTask('stop')}><Square className="mr-1 h-4 w-4" />停止</Button>}
+            </div>
+          </div>
+        </div>
+      )}
       {deliveryTask && (
         <div className="mb-4 rounded-2xl border border-card-border bg-[#FFFCFA] p-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -1524,6 +2149,7 @@ function JobsPoolView() {
         onClose={() => setShowScoreDialog(false)}
         onStart={startScoring}
       />
+      <TaskCompletionDialog task={completionTask} onConfirm={acknowledgeCompletion} onRetry={retryCompletion} />
     </div>
   )
 }

@@ -32,10 +32,12 @@ search:
 collection:
   default_order: [boss]
   auto_score_default: false
-  # safe_serial（默认）| pipelined（采集期间分批评分）| parallel_pilot（仅智联+51job受控并行）
+  # safe_serial（默认）| pipelined | parallel_pilot（智联+51job）| parallel_boss_zhilian（BOSS+智联）
   execution_mode: safe_serial
-  # 仅用于受控发布；普通配置请保持 false。
+  # 可在岗位采集窗口或配置页显式开启；并行模式均为受控试点。
   parallel_pilot_enabled: false
+  parallel_boss_zhilian_enabled: false
+  parallel_all_platforms_enabled: false # 三平台并行试点开关，默认关闭
   max_non_boss_workers: 2
   max_browser_targets: 3
   score_batch_size: 5
@@ -49,6 +51,13 @@ collection:
   collection_delay_multiplier: 1.5 # BOSS 采集等待时间倍数
   delivery_cooldown_min_minutes: 5   # BOSS 采集结束到 BOSS 投递的随机冷却下限
   delivery_cooldown_max_minutes: 15  # BOSS 采集结束到 BOSS 投递的随机冷却上限
+  # 智联与 51job 只做只读采集，不自动投递；以下随机间隔沿用当前安全默认值。
+  zhilian_detail_delay_min_seconds: 8    # 智联相邻详情页随机等待下限（秒）
+  zhilian_detail_delay_max_seconds: 15   # 智联相邻详情页随机等待上限（秒）
+  job51_page_delay_min_seconds: 30       # 51job 翻页前随机等待下限（秒）
+  job51_page_delay_max_seconds: 45       # 51job 翻页前随机等待上限（秒）
+  job51_detail_delay_min_seconds: 12     # 51job 相邻详情页随机等待下限（秒）
+  job51_detail_delay_max_seconds: 20     # 51job 相邻详情页随机等待上限（秒）
 
 platforms:
   boss:
@@ -73,8 +82,8 @@ platforms:
     # 51job 目前只开放采集/评分/招呼语生成，真实发送和监听仍锁定。
     search:
       keywords: []
-      cities: ["上海"]
-      city_codes: {"上海": "020000"}
+      cities: ["北京", "上海", "广州", "深圳", "成都", "重庆", "杭州", "武汉", "西安", "苏州", "南京", "天津", "郑州", "长沙", "东莞", "宁波", "青岛", "合肥", "佛山"]
+      city_codes: {"北京": "010000", "上海": "020000", "广州": "030200", "深圳": "040000", "成都": "090200", "重庆": "060000", "杭州": "080200", "武汉": "180200", "西安": "200200", "苏州": "070300", "南京": "070200", "天津": "050000", "郑州": "170200", "长沙": "190200", "东莞": "030800", "宁波": "080300", "青岛": "120200", "合肥": "080100", "佛山": "030600"}
       max_pages: 1
       sort: default
 
@@ -94,16 +103,24 @@ throttle:
   day_off_probability: 0.05
 
 ai:
-  provider: "anthropic"
-  service: "anthropic"           # anthropic / deepseek / doubao / custom
-  model: "claude-sonnet-4-6"
-  thinking: "auto"               # auto / disabled / enabled / off
-  thinking_budget: 2048           # thinking=enabled 时使用，至少 1024
-  timeout_seconds: 180
+  # 可保存多条 API 配置；active_profile_id 决定运行时使用哪一条。
+  active_profile_id: "primary"
+  profiles:
+    - id: "primary"
+      name: "主 API"              # 可自由备注命名
+      service: "anthropic"        # anthropic / deepseek / doubao / custom
+      provider: "anthropic"       # 由 service 自动确定
+      model: "claude-sonnet-4-6"
+      thinking: "auto"            # auto / disabled / enabled / off
+      thinking_budget: 2048        # thinking=enabled 时使用，至少 1024
+      timeout_seconds: 180
+      # api_key: "your-api-key"
+      # base_url: "https://api.anthropic.com"
   scoring_max_tokens: 8192
   scoring_max_attempts: 2
   scoring_concurrency: 2          # AI评分并发数，默认2、范围1-3；数据库仍串行写入
   scoring_second_review: false    # 可选：对68-79分临界岗位进行一次独立复核
+  greeting_concurrency: 2         # 招呼语生成并发数，默认2、范围1-3；数据库仍串行写入
   greeting_max_tokens: 8192
   greeting_review_max_tokens: 4096
   greeting_max_attempts: 2
@@ -115,9 +132,8 @@ ai:
   greeting_review_threshold: 7
   greeting_max_iterations: 2
   resume_max_pages: 3
-  # api_key 可通过对应环境变量设置（ANTHROPIC_API_KEY / DEEPSEEK_API_KEY / ARK_API_KEY / OPENAI_API_KEY）
-  # api_key: "your-api-key"
-  # base_url: "https://api.anthropic.com"
+  # 每条配置均可通过对应环境变量设置 Key：
+  # ANTHROPIC_API_KEY / DEEPSEEK_API_KEY / ARK_API_KEY / OPENAI_API_KEY
 
 monitor:
   interval: 30

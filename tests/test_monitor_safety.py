@@ -119,6 +119,51 @@ class MonitorThrottleTests(unittest.TestCase):
         self.assertEqual(events, ["open", "mark", "wait", "open", "mark"])
 
 
+class MonitorSendWindowTests(unittest.TestCase):
+    def test_standalone_monitor_processes_hr_reply_outside_send_window(self):
+        from bosshunter.executor import monitor
+
+        config = {"throttle": {"send_windows": ["09:00-16:00"]}}
+        conversation = {
+            "job": {
+                "id": "outside-window",
+                "company": "公司",
+                "title": "岗位",
+            },
+            "conversation": {},
+        }
+
+        with patch.object(monitor, "SendWindowChecker") as checker_cls, \
+             patch.object(monitor, "RequestThrottle"), \
+             patch.object(monitor, "check_replies", return_value=[conversation]) as check_replies, \
+             patch.object(monitor, "_handle_conversation", return_value="auto_replied") as handle_conversation, \
+             patch.object(monitor, "_check_follow_ups", return_value=0) as follow_ups:
+            checker_cls.return_value.is_active.return_value = False
+            summary = monitor.monitor_and_send_resumes(
+                config,
+                allow_outside_send_window=True,
+            )
+
+        self.assertEqual(summary["replied"], 1)
+        check_replies.assert_called_once()
+        handle_conversation.assert_called_once()
+        follow_ups.assert_not_called()
+
+    def test_non_standalone_monitor_still_defers_outside_send_window(self):
+        from bosshunter.executor import monitor
+
+        config = {"throttle": {"send_windows": ["09:00-16:00"]}}
+
+        with patch.object(monitor, "SendWindowChecker") as checker_cls, \
+             patch.object(monitor, "RequestThrottle"), \
+             patch.object(monitor, "check_replies", return_value=[]) as check_replies:
+            checker_cls.return_value.is_active.return_value = False
+            summary = monitor.monitor_and_send_resumes(config)
+
+        self.assertEqual(summary["replied"], 0)
+        check_replies.assert_not_called()
+
+
 class MonitorIdempotencyAndLimitTests(unittest.TestCase):
     def test_same_unresolved_reply_is_skipped_but_new_hr_message_is_processed(self):
         from bosshunter.executor import monitor

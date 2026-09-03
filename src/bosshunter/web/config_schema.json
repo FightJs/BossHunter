@@ -35,7 +35,11 @@
       "icon": "ListOrdered",
       "fields": [
         {"key": "default_order", "label": "默认平台顺序", "type": "multi-select", "options": ["boss", "zhilian", "51job"], "default": ["boss"]},
-        {"key": "auto_score_default", "label": "采集后自动评分", "type": "switch", "default": false}
+        {"key": "auto_score_default", "label": "采集后自动评分", "type": "switch", "default": false},
+        {"key": "parallel_pilot_enabled", "label": "启用受控并行采集", "type": "switch", "default": false, "description": "仅智联与 51job 使用多窗口并行；BOSS 始终保持单通道"},
+        {"key": "parallel_boss_zhilian_enabled", "label": "启用 BOSS + 智联并行", "type": "switch", "default": false, "description": "高风险试点：BOSS 与智联各使用一个独立标签页并行采集"},
+        {"key": "parallel_all_platforms_enabled", "label": "启用三平台并行", "type": "switch", "default": false, "description": "更高风险试点：BOSS、智联和 51job 各使用一个独立标签页并行采集"},
+        {"key": "max_non_boss_workers", "label": "并行采集工作者数", "type": "number", "min": 1, "max": 2, "default": 2, "description": "最多同时运行两个非 BOSS 平台采集工作者"}
       ]
     },
     {
@@ -69,7 +73,13 @@
         {"key": "risk_pause_max_minutes", "label": "BOSS 风险暂停最多分钟", "type": "number", "min": 1, "max": 60, "default": 10},
         {"key": "collection_delay_multiplier", "label": "BOSS 操作间隔倍率", "type": "number", "min": 1, "max": 5, "step": 0.1, "default": 1.5, "description": "同时作用于 BOSS 采集和监测的页面操作与每轮等待"},
         {"key": "delivery_cooldown_min_minutes", "label": "BOSS 采集后投递冷却最少（分钟）", "type": "number", "min": 0, "max": 240, "default": 5},
-        {"key": "delivery_cooldown_max_minutes", "label": "BOSS 采集后投递冷却最多（分钟）", "type": "number", "min": 0, "max": 240, "default": 15}
+        {"key": "delivery_cooldown_max_minutes", "label": "BOSS 采集后投递冷却最多（分钟）", "type": "number", "min": 0, "max": 240, "default": 15},
+        {"key": "zhilian_detail_delay_min_seconds", "label": "智联招聘 详情间隔最少（秒）", "type": "number", "min": 1, "max": 120, "default": 8, "description": "智联采集相邻详情页之间的随机等待下限"},
+        {"key": "zhilian_detail_delay_max_seconds", "label": "智联招聘 详情间隔最多（秒）", "type": "number", "min": 1, "max": 120, "default": 15, "description": "智联采集相邻详情页之间的随机等待上限"},
+        {"key": "job51_page_delay_min_seconds", "label": "51job 翻页间隔最少（秒）", "type": "number", "min": 10, "max": 600, "default": 30, "description": "51job 翻页前随机等待下限"},
+        {"key": "job51_page_delay_max_seconds", "label": "51job 翻页间隔最多（秒）", "type": "number", "min": 10, "max": 600, "default": 45, "description": "51job 翻页前随机等待上限"},
+        {"key": "job51_detail_delay_min_seconds", "label": "51job 详情间隔最少（秒）", "type": "number", "min": 1, "max": 300, "default": 12, "description": "51job 相邻详情页之间的随机等待下限"},
+        {"key": "job51_detail_delay_max_seconds", "label": "51job 详情间隔最多（秒）", "type": "number", "min": 1, "max": 300, "default": 20, "description": "51job 相邻详情页之间的随机等待上限"}
       ]
     },
     {
@@ -83,7 +93,7 @@
         {"key": "browse_before_greet", "label": "发送前模拟浏览", "type": "switch", "default": true},
         {"key": "browse_duration_min", "label": "浏览最短时长 (秒)", "type": "number", "min": 5, "max": 120, "default": 15},
         {"key": "browse_duration_max", "label": "浏览最长时长 (秒)", "type": "number", "min": 5, "max": 120, "default": 30},
-        {"key": "send_windows", "label": "发送时间窗口", "type": "tags", "default": ["09:00-16:00"], "description": "格式: HH:MM-HH:MM；后台任务会在最后一个窗口结束时自动停止"},
+        {"key": "send_windows", "label": "发送时间窗口", "type": "tags", "default": ["09:00-16:00"], "description": "格式: HH:MM-HH:MM；投递等主动发送任务会在窗口结束时停止，单独监测不受此限制"},
         {"key": "day_off_probability", "label": "随机休息概率", "type": "number", "min": 0, "max": 1, "step": 0.01, "default": 0.05}
       ]
     },
@@ -92,6 +102,8 @@
       "label": "AI 设置",
       "icon": "Brain",
       "fields": [
+        {"key": "profiles", "label": "API 配置列表", "type": "list", "description": "可保存多条独立的 API 配置，每条配置包含备注名称、服务商、模型、凭证和连接参数"},
+        {"key": "active_profile_id", "label": "当前使用的 API 配置", "type": "text", "description": "对应 profiles 中要用于运行的配置 ID"},
         {"key": "service", "label": "AI 服务商", "type": "select", "options": ["anthropic", "deepseek", "doubao", "custom"], "default": "anthropic", "description": "支持 Claude、DeepSeek、豆包和其他 OpenAI 兼容接口"},
         {"key": "provider", "label": "接口协议", "type": "select", "options": ["anthropic", "openai_compatible"], "default": "anthropic", "description": "由服务商预设自动选择"},
         {"key": "model", "label": "模型名称", "type": "text", "default": "claude-sonnet-4-6"},

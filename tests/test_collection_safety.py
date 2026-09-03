@@ -27,6 +27,12 @@ class CollectionSafetyTests(unittest.TestCase):
         self.assertEqual(collection["risk_pause_min_minutes"], 5)
         self.assertEqual(collection["risk_pause_max_minutes"], 10)
         self.assertEqual(collection["collection_delay_multiplier"], 1.5)
+        self.assertEqual(collection["zhilian_detail_delay_min_seconds"], 8.0)
+        self.assertEqual(collection["zhilian_detail_delay_max_seconds"], 15.0)
+        self.assertEqual(collection["job51_page_delay_min_seconds"], 30.0)
+        self.assertEqual(collection["job51_page_delay_max_seconds"], 45.0)
+        self.assertEqual(collection["job51_detail_delay_min_seconds"], 12.0)
+        self.assertEqual(collection["job51_detail_delay_max_seconds"], 20.0)
         self.assertNotIn("max_new_jobs_per_cycle", collection)
         self.assertNotIn("max_search_pages_per_cycle", collection)
 
