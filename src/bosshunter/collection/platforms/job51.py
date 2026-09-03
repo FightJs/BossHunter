@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -27,12 +28,45 @@ PAGE_DELAY_MIN_SECONDS = 30.0
 PAGE_DELAY_MAX_SECONDS = 45.0
 RENDER_POLL_INTERVAL_SECONDS = 0.75
 RENDER_POLL_ATTEMPTS = 10
+# jobs.51job.com/all/co... URLs point to the company profile page, not a
+# job detail. They must never be opened as a detail page.
+COMPANY_PAGE_RE = re.compile(r"/all/co[A-Za-z0-9_-]+\.html$")
+DETAIL_URL_TEMPLATE = "https://jobs.51job.com/all/{job_id}.html"
+# Detail pages append recruiter-internal job numbers to the title, e.g.
+# "AI 工程师 (职位编号：12345)"; drop that boilerplate before storing.
+DETAIL_TITLE_NOISE = re.compile(r"\s*[（(]\s*职位编号\s*[：:][^）)]*[）)]\s*$")
+
+
+def _delay_seconds(value: Any, default: float, minimum: float = 1.0) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(parsed, minimum)
+
 
 # Only codes verified by the contributed implementation are bundled. Unknown
 # cities are rejected instead of guessing or reusing another platform's code.
 CITY_SNAPSHOT = (
     {"name": "北京", "code": "010000"},
     {"name": "上海", "code": "020000"},
+    {"name": "广州", "code": "030200"},
+    {"name": "深圳", "code": "040000"},
+    {"name": "成都", "code": "090200"},
+    {"name": "重庆", "code": "060000"},
+    {"name": "杭州", "code": "080200"},
+    {"name": "武汉", "code": "180200"},
+    {"name": "西安", "code": "200200"},
+    {"name": "苏州", "code": "070300"},
+    {"name": "南京", "code": "070200"},
+    {"name": "天津", "code": "050000"},
+    {"name": "郑州", "code": "170200"},
+    {"name": "长沙", "code": "190200"},
+    {"name": "东莞", "code": "030800"},
+    {"name": "宁波", "code": "080300"},
+    {"name": "青岛", "code": "120200"},
+    {"name": "合肥", "code": "080100"},
+    {"name": "佛山", "code": "030600"},
 )
 
 
@@ -40,7 +74,7 @@ def load_51job_city_snapshot() -> dict[str, Any]:
     return {
         "schema": "bosshunter.51job_cities.v1",
         "source": "verified_snapshot",
-        "note": "当前内置已核验的北京、上海城市编码；其他城市需核验后再加入。",
+        "note": "当前内置一线及新一线城市的 51job 城市编码；其他城市需核验后再加入。",
         "cities": [dict(item) for item in CITY_SNAPSHOT],
     }
 
@@ -60,8 +94,10 @@ JS_EXTRACT_LIST = r"""
     if (blocked) return JSON.stringify({status: 'blocked', jobs: []});
     var cards = Array.prototype.slice.call(document.querySelectorAll('.joblist-item'));
     if (!cards.length) {
-        var generic = /全国招聘/.test(document.title || '');
-        return JSON.stringify({status: generic ? 'throttled' : 'waiting', jobs: []});
+        // 51job is an SPA: the shell title can be present before results are
+        // rendered. Do not infer throttling from the title alone; only the
+        // explicit verification/rate-limit markers above are fail-closed.
+        return JSON.stringify({status: 'waiting', jobs: []});
     }
     var jobs = [];
     for (var i = 0; i < cards.length; i++) {
@@ -72,8 +108,21 @@ JS_EXTRACT_LIST = r"""
         try { meta = JSON.parse((dataNode && dataNode.getAttribute('sensorsdata')) || '{}'); } catch (_) {}
         var id = String(meta.jobId || '').trim();
         var title = String(meta.jobTitle || '').replace(/^招聘/, '').trim();
-        var linkNode = card.querySelector('a[href*="jobs.51job.com/"]');
-        var jobUrl = linkNode ? String(linkNode.href || '').trim() : '';
+        // The current SPA cards only hyperlink the company profile
+        // (jobs.51job.com/all/co...); the job title itself is a plain span.
+        // Prefer a real job-detail link when one exists (older layouts),
+        // otherwise build the canonical detail URL from the numeric job id.
+        var jobUrl = '';
+        var cardLinks = card.querySelectorAll('a[href*="jobs.51job.com/"]');
+        for (var j = 0; j < cardLinks.length; j++) {
+            var href = String(cardLinks[j].href || '').trim();
+            if (/\/all\/co[A-Za-z0-9_-]+\.html$/.test(href)) continue;
+            jobUrl = href;
+            break;
+        }
+        if (!jobUrl && /^\d+$/.test(id)) {
+            jobUrl = 'https://jobs.51job.com/all/' + id + '.html';
+        }
         if (!id || !title || !/^https:\/\/jobs\.51job\.com\//.test(jobUrl) || /APP下载|访问验证/.test(title)) continue;
         var companyNode = card.querySelector('[class*="company"], [class*="cname"], [class*="comname"], .comp');
         var company = companyNode ? String(companyNode.innerText || '').trim().split('\n')[0] : '';
@@ -162,14 +211,44 @@ class Job51Collector:
         browser: Job51Browser | None = None,
         sleep: Callable[[float], None] = time.sleep,
         uniform: Callable[[float, float], float] = random.SystemRandom().uniform,
-        detail_delay_range: tuple[float, float] = (DETAIL_DELAY_MIN_SECONDS, DETAIL_DELAY_MAX_SECONDS),
-        page_delay_range: tuple[float, float] = (PAGE_DELAY_MIN_SECONDS, PAGE_DELAY_MAX_SECONDS),
+        detail_delay_range: tuple[float, float] | None = None,
+        page_delay_range: tuple[float, float] | None = None,
+        config: dict[str, Any] | None = None,
     ):
         self.browser = browser or Job51Browser(navigate_action=browser_navigate)
         self.sleep = sleep
         self.uniform = uniform
-        self.detail_delay_range = detail_delay_range
-        self.page_delay_range = page_delay_range
+        collection_cfg = config.get("collection", {}) if isinstance(config, dict) else {}
+        if detail_delay_range is not None:
+            self.detail_delay_range = detail_delay_range
+        else:
+            detail_min = _delay_seconds(
+                collection_cfg.get("job51_detail_delay_min_seconds"),
+                DETAIL_DELAY_MIN_SECONDS,
+            )
+            detail_max = max(
+                detail_min,
+                _delay_seconds(
+                    collection_cfg.get("job51_detail_delay_max_seconds"),
+                    DETAIL_DELAY_MAX_SECONDS,
+                ),
+            )
+            self.detail_delay_range = (detail_min, detail_max)
+        if page_delay_range is not None:
+            self.page_delay_range = page_delay_range
+        else:
+            page_min = _delay_seconds(
+                collection_cfg.get("job51_page_delay_min_seconds"),
+                PAGE_DELAY_MIN_SECONDS,
+            )
+            page_max = max(
+                page_min,
+                _delay_seconds(
+                    collection_cfg.get("job51_page_delay_max_seconds"),
+                    PAGE_DELAY_MAX_SECONDS,
+                ),
+            )
+            self.page_delay_range = (page_min, page_max)
 
     @staticmethod
     def build_search_url(request: PlatformCollectionRequest, city: str, keyword: str) -> str:
@@ -275,13 +354,24 @@ class Job51Collector:
         return PlatformCollectionResult(self.platform, "completed", "search_exhausted", "51job 搜索结果已采集完毕")
 
     @staticmethod
+    def _detail_url(raw_url: str, source_job_id: str) -> str:
+        """Return a real job-detail URL, ignoring company profile links."""
+        candidate = str(raw_url or "").strip()
+        if candidate.startswith("https://jobs.51job.com/") and not COMPANY_PAGE_RE.search(candidate):
+            return candidate
+        source_job_id = str(source_job_id or "").strip()
+        if source_job_id.isdigit():
+            return DETAIL_URL_TEMPLATE.format(job_id=source_job_id)
+        return ""
+
+    @staticmethod
     def _candidate_from_list(raw: Any, city: str, keyword: str) -> JobCandidate | None:
         if not isinstance(raw, dict):
             return None
         source_id = str(raw.get("source_job_id") or "").strip()
         title = str(raw.get("title") or "").strip()
-        url = str(raw.get("url") or "").strip()
-        if not source_id or not title or not url.startswith("https://jobs.51job.com/"):
+        url = Job51Collector._detail_url(str(raw.get("url") or "").strip(), source_id)
+        if not source_id or not title or not url:
             return None
         return JobCandidate(
             platform="51job",
@@ -296,11 +386,17 @@ class Job51Collector:
         )
 
     @staticmethod
+    def _clean_detail_title(value: object) -> str:
+        title = str(value or "").replace("\u00a0", " ").strip()
+        return DETAIL_TITLE_NOISE.sub("", title).strip()
+
+    @staticmethod
     def _candidate_from_detail(detail: dict[str, Any], base: JobCandidate) -> JobCandidate:
+        detail_title = Job51Collector._clean_detail_title(detail.get("title") or "")
         return JobCandidate(
             platform="51job",
             source_job_id=base.source_job_id,
-            title=str(detail.get("title") or base.title).strip(),
+            title=detail_title or base.title,
             company=str(detail.get("company") or base.company).strip(),
             salary=str(detail.get("salary") or base.salary).strip(),
             city=str(detail.get("city") or base.city).strip(),
