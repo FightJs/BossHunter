@@ -5,13 +5,13 @@
   <a href="https://github.com/shengjidaguai-china">点击组织首页右上角 <strong>Follow</strong></a>，及时获取新项目与共建活动
 </p>
 
-# BossHunter v2.3.1
+# BossHunter v2.4.0
 
 > 某直聘智能求职 Agent — 从岗位采集、AI 评分到人工确认投递、回复监测与定制简历生成的本地自动化流水线
 
 <p align="center">
   <a href="https://github.com/powerycy/BossHunter/stargazers"><img alt="GitHub Stars" src="https://img.shields.io/github/stars/powerycy/BossHunter?style=social"></a>
-  <a href="https://github.com/powerycy/BossHunter"><img alt="Version" src="https://img.shields.io/badge/version-v2.3.1-FB6511"></a>
+  <a href="https://github.com/powerycy/BossHunter"><img alt="Version" src="https://img.shields.io/badge/version-v2.4.0-FB6511"></a>
   <a href="https://www.python.org/"><img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white"></a>
   <a href="LICENSE"><img alt="Non-Commercial License" src="https://img.shields.io/badge/license-Non--Commercial-6f42c1"></a>
   <a href="https://github.com/powerycy/BossHunter/issues"><img alt="GitHub Issues" src="https://img.shields.io/github/issues/powerycy/BossHunter"></a>
@@ -21,6 +21,16 @@
 <p align="center">
   🚀 本地运行 · 🔒 人工确认 · 🤖 多模型兼容 · 🧭 Chrome 自动化
 </p>
+
+## 🆕 v2.4.0 新增功能
+
+- **并行工作台**：职位采集、AI 评分与招呼语生成可并行执行，也可以只运行其中一步；任务完成时可在弹窗中查看运行摘要。
+- **采集加速**：新增预筛选与并行编排，不同平台可按资源独立采集；并行 AI 评分默认开启，默认 2 个并发工作器（可配置 1–3）。
+- **51job 真实详情链接**：适配搜索列表改版，采集可打开的真实岗位详情 URL。
+- **智联登录弹窗容错**：单次详情页登录提示不再中断整轮采集，只有连续出现登录墙才会暂停并提示重新登录。
+- **工程改进**：加入 `uv.lock`，保证依赖可复现。
+
+> 更完整的变更说明见 [CHANGELOG.md](CHANGELOG.md)。
 
 **BossHunter** 面向正在集中求职、又不想把时间耗在重复筛选和机械沟通上的用户。它通过「AI 评分 + 人工确认」策略，帮助你筛选岗位、准备沟通内容并管理投递状态，同时把最终发送决定留在你手里。
 
@@ -372,6 +382,7 @@ A: 项目通过 CDP (Chrome DevTools Protocol) 直连你日常使用的浏览器
 
 | 日期 | 版本号 | 类型 | 更新内容 |
 |------|--------|------|----------|
+| 2026-09-04 | v2.4.0 | 并行采集与工作台 | 增加职位采集加速与并行工作台（采集 / AI 评分 / 招呼语可并行），默认启用并行 AI 评分；修复 51job 真实详情 URL，优化智联登录弹窗容错，并加入 uv.lock。 |
 | 2026-08-25 | v2.3.1 | 多平台与安全整合 | 合入智联/51job 只读采集、外部平台人工投递闭环、岗位池与筛选增强、Windows 兼容、招呼语与消息判定修复，并重整 BOSS 页面访问保护设置。 |
 | 2026-08-13 | v2.3.0 | 功能与可恢复性 | 增加多范围岗位导出、离线城市目录、任务安全的岗位回收站和可独立重试的 AI 评分；同步改进配置安全、岗位筛选与投递队列。 |
 | 2026-08-02 | v2.2.0 | 功能与稳定性 | 单岗位失败不再中断全流程；额度未完成岗位下次优先续发；加强首次沟通、历史会话、任务停止、后台页面与最新配置生效逻辑，并简化工作台。 |
@@ -381,6 +392,23 @@ A: 项目通过 CDP (Chrome DevTools Protocol) 直连你日常使用的浏览器
 | 2026-06-29 | v2.0.0 | 稳定性 | 修复工作台任务可能卡住的问题；自动跟进默认关闭，把发送决定留给用户。 |
 
 > 查看每个版本的完整说明：[CHANGELOG.md](CHANGELOG.md)
+
+<details>
+<summary><strong>展开查看 v2.4.0 并行采集与工作台更新</strong></summary>
+
+### 并行采集与工作台
+
+- **按资源并行运行**：职位采集、AI 评分与招呼语生成可以并行执行，也可以只启动其中一步；投递与监测仍共用浏览器安全通道，彼此互斥。
+- **采集加速**：新增搜索预筛选与并行采集编排，支持在同一浏览器内安全地并行处理多个平台标签页；高风险的全平台并行模式保持默认关闭。
+- **并行 AI 评分默认开启**：默认使用 2 个并发工作器，可在配置页调整为 1–3；模型请求并行，状态与评分写入保持串行可靠。
+
+### 修复与稳定性
+
+- **51job 真实详情 URL**：适配搜索列表页改版，采集结果可打开真实岗位详情页。
+- **智联登录弹窗容错**：只读详情中的登录 CTA 不再被误判为登录墙；只有连续 3 个被登录墙遮挡的详情页才会暂停智联队列，并提示用户重新登录后重试。
+- **依赖可复现**：加入 `uv.lock` 锁文件。
+
+</details>
 
 <details>
 <summary><strong>展开查看 v2.3.1 多平台与安全整合</strong></summary>
