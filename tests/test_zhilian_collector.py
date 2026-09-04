@@ -366,3 +366,89 @@ class ZhilianFixtureTests(TestCase):
         self.assertEqual(navigated, ["https://www.zhaopin.com/sou/jl530/"])
         self.assertEqual(collected[0].storage_id, "zhilian:CC123J40800000001")
         self.assertIn("用户增长", collected[0].jd)
+
+    def test_detail_login_wall_is_not_fatal_until_it_repeats(self):
+        responses = {
+            "list": json.dumps({"items": [
+                {"source_job_id": "zl-1", "title": "岗位一", "company": "公司一", "city": "北京"},
+                {"source_job_id": "zl-2", "title": "岗位二", "company": "公司二", "city": "北京"},
+                {"source_job_id": "zl-3", "title": "岗位三", "company": "公司三", "city": "北京"},
+            ]}),
+        }
+        detail_queue = [
+            {"status": "login_required", "title": "岗位一", "company": "公司一", "city": "北京"},
+            {"source_job_id": "zl-2", "title": "岗位二", "company": "公司二", "city": "北京", "jd": "JD-2"},
+            {"source_job_id": "zl-3", "title": "岗位三", "company": "公司三", "city": "北京", "jd": "JD-3"},
+        ]
+        browser = ZhilianBrowser(
+            new_tab=lambda _url, **_kwargs: "tab-wall",
+            close_tab=lambda _target: True,
+            evaluate=lambda _target, script: json.dumps(detail_queue.pop(0))
+            if "describtion__detail-content" in script
+            else responses["list"],
+            scroll=lambda *_args, **_kwargs: True,
+            wait_for_load=lambda *_args, **_kwargs: True,
+        )
+        collected = []
+        parse_failures = []
+        hooks = CollectorHooks(
+            stop_event=None,
+            on_list_candidate=lambda candidate: True,
+            on_candidate=lambda candidate: collected.append(candidate) or True,
+            on_parse_failed=lambda reason: parse_failures.append(reason),
+            on_event=lambda **_kwargs: None,
+        )
+
+        result = ZhilianCollector(browser=browser, sleep=lambda _seconds: None).collect(
+            PlatformCollectionRequest("zhilian", ["AI"], ["北京"], {"北京": "530"}, max_pages=1),
+            hooks,
+        )
+
+        self.assertEqual(result.status, "completed")
+        self.assertEqual(result.reason_code, "search_exhausted")
+        self.assertEqual([candidate.source_job_id for candidate in collected], ["zl-2", "zl-3"])
+        self.assertEqual(len(parse_failures), 1)
+        self.assertIn("跳过该岗位继续采集", parse_failures[0])
+
+    def test_repeated_detail_login_walls_stop_zhilian_queue(self):
+        responses = {
+            "list": json.dumps({"items": [
+                {"source_job_id": "zl-1", "title": "岗位一", "company": "公司一", "city": "北京"},
+                {"source_job_id": "zl-2", "title": "岗位二", "company": "公司二", "city": "北京"},
+                {"source_job_id": "zl-3", "title": "岗位三", "company": "公司三", "city": "北京"},
+            ]}),
+        }
+        detail_queue = [
+            {"status": "login_required", "title": "岗位一", "company": "公司一", "city": "北京"},
+            {"status": "login_required", "title": "岗位二", "company": "公司二", "city": "北京"},
+            {"status": "login_required", "title": "岗位三", "company": "公司三", "city": "北京"},
+        ]
+        browser = ZhilianBrowser(
+            new_tab=lambda _url, **_kwargs: "tab-wall",
+            close_tab=lambda _target: True,
+            evaluate=lambda _target, script: json.dumps(detail_queue.pop(0))
+            if "describtion__detail-content" in script
+            else responses["list"],
+            scroll=lambda *_args, **_kwargs: True,
+            wait_for_load=lambda *_args, **_kwargs: True,
+        )
+        collected = []
+        parse_failures = []
+        hooks = CollectorHooks(
+            stop_event=None,
+            on_list_candidate=lambda candidate: True,
+            on_candidate=lambda candidate: collected.append(candidate) or True,
+            on_parse_failed=lambda reason: parse_failures.append(reason),
+            on_event=lambda **_kwargs: None,
+        )
+
+        result = ZhilianCollector(browser=browser, sleep=lambda _seconds: None).collect(
+            PlatformCollectionRequest("zhilian", ["AI"], ["北京"], {"北京": "530"}, max_pages=1),
+            hooks,
+        )
+
+        self.assertEqual(result.status, "blocked")
+        self.assertEqual(result.reason_code, "login_required")
+        self.assertIn("完成智联登录后重试", result.message)
+        self.assertEqual(collected, [])
+        self.assertEqual(len(parse_failures), 2)

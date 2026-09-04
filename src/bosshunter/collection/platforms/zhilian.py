@@ -51,6 +51,11 @@ JD_CLASSES = (
 DETAIL_PATH_PATTERN = re.compile(r"/(?:jobdetail|job|position|detail)/[^/?]+", re.IGNORECASE)
 DETAIL_DELAY_MIN_SECONDS = 8.0
 DETAIL_DELAY_MAX_SECONDS = 15.0
+# How many consecutive detail pages must report a login wall before the
+# platform queue is stopped. A single wall can be a per-job restricted
+# detail or a transient SPA dialog; only a sustained wall means the
+# account session really needs attention.
+DETAIL_LOGIN_WALL_LIMIT = 3
 ZHILIAN_SEARCH_INPUT_SELECTOR = (
     'input[placeholder="输入职位、公司等搜索"], '
     'input[placeholder="搜索职位、公司"], '
@@ -248,7 +253,10 @@ JS_EXTRACT_DETAIL = """
   const cityText = cityNode ? cityNode.textContent.trim() : '';
   const city = expectedCity && cityText.includes(expectedCity) ? expectedCity : cityText;
   return JSON.stringify({
-    status: blockedMatch ? 'blocked' : loginRequired ? 'login_required' : jd ? 'ready' : 'selector_changed',
+    // Only treat login copy as a wall when it actually hides the JD. Normal
+    // detail pages can contain login CTAs (contact info / apply hints) next to
+    // a fully readable JD; stopping the queue on those is a false positive.
+    status: blockedMatch ? 'blocked' : (loginRequired && !jd) ? 'login_required' : jd ? 'ready' : 'selector_changed',
     title: title ? title.textContent.trim() : '', salary: salary ? salary.textContent.trim() : '',
     company: company ? company.textContent.trim() : '', city,
     jd: jd ? jd.textContent.trim() : '', url: detailLink ? detailLink.href : window.location.href
@@ -677,6 +685,7 @@ class ZhilianCollector:
         if any(not str(request.city_codes.get(city) or "").strip() for city in request.cities):
             return PlatformCollectionResult(self.platform, "failed", "no_valid_city", "智联城市编码未配置")
         detail_requests = 0
+        consecutive_login_walls = 0
         for city in request.cities:
             for keyword in request.keywords:
                 target_id: str | None = None
@@ -771,7 +780,16 @@ class ZhilianCollector:
                                     if detail.get("status") == "blocked":
                                         return PlatformCollectionResult(self.platform, "blocked", "rate_limit", "智联页面出现验证或限流，已停止整个采集队列")
                                     if detail.get("status") == "login_required":
-                                        return PlatformCollectionResult(self.platform, "blocked", "login_required", "智联页面要求重新登录，已停止整个采集队列")
+                                        consecutive_login_walls += 1
+                                        if consecutive_login_walls >= DETAIL_LOGIN_WALL_LIMIT:
+                                            return PlatformCollectionResult(
+                                                self.platform, "blocked", "login_required",
+                                                "智联连续要求重新登录，已停止智联采集队列；请在 Chrome 中完成智联登录后重试",
+                                            )
+                                        hooks.on_parse_failed(
+                                            f"智联侧栏详情提示登录（连续 {consecutive_login_walls}/{DETAIL_LOGIN_WALL_LIMIT} 次），跳过该岗位继续采集"
+                                        )
+                                        continue
                                     if detail.get("status") == "selector_changed":
                                         return PlatformCollectionResult(self.platform, "blocked", "selector_changed", "智联侧栏详情结构变化，已安全停止")
                                     base = self._candidate_from_list(detail, city, keyword)
@@ -787,6 +805,7 @@ class ZhilianCollector:
                                     continue
                                 if not hooks.on_candidate(final):
                                     return PlatformCollectionResult(self.platform, "completed", "callback_stopped", "采集回调已停止")
+                                consecutive_login_walls = 0
                                 continue
                             candidate = self._candidate_from_list(raw_item, city, keyword)
                             if candidate is None or not hooks.on_list_candidate(candidate):
@@ -828,7 +847,16 @@ class ZhilianCollector:
                                 if detail.get("status") == "blocked":
                                     return PlatformCollectionResult(self.platform, "blocked", "rate_limit", "智联详情页出现验证或限流，已停止整个采集队列")
                                 if detail.get("status") == "login_required":
-                                    return PlatformCollectionResult(self.platform, "blocked", "login_required", "智联详情页要求重新登录，已停止整个采集队列")
+                                    consecutive_login_walls += 1
+                                    if consecutive_login_walls >= DETAIL_LOGIN_WALL_LIMIT:
+                                        return PlatformCollectionResult(
+                                            self.platform, "blocked", "login_required",
+                                            "智联连续要求重新登录，已停止智联采集队列；请在 Chrome 中完成智联登录后重试",
+                                        )
+                                    hooks.on_parse_failed(
+                                        f"智联详情页提示登录（连续 {consecutive_login_walls}/{DETAIL_LOGIN_WALL_LIMIT} 次），跳过该岗位继续采集"
+                                    )
+                                    continue
                                 if detail.get("status") == "selector_changed":
                                     return PlatformCollectionResult(self.platform, "blocked", "selector_changed", "智联详情页结构变化，已安全停止")
                                 if not detail.get("source_job_id"):
@@ -849,6 +877,7 @@ class ZhilianCollector:
                                 continue
                             if not hooks.on_candidate(final):
                                 return PlatformCollectionResult(self.platform, "completed", "callback_stopped", "采集回调已停止")
+                            consecutive_login_walls = 0
                 finally:
                     if target_id:
                         self.browser.close_tab(target_id)
